@@ -93,9 +93,50 @@ def parse_stock(item):
     except (ValueError, TypeError):
         return None
 
+def fetch_stock_yahoo(code, market='tse'):
+    """Yahoo Finance fallback for when TWSE API is blocked (e.g. cloud deploy outside Taiwan)"""
+    suffix = '.TW' if market == 'tse' else '.TWO'
+    sym = f'{code}{suffix}'
+    try:
+        url = f'https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=5d'
+        data = cached_get(url, ttl=30)
+        result = data.get('chart', {}).get('result', [{}])[0]
+        meta = result.get('meta', {})
+        price = meta.get('regularMarketPrice')
+        prev = meta.get('chartPreviousClose') or meta.get('previousClose')
+        if not price:
+            return None
+        price, prev = float(price), float(prev) if prev else float(price)
+        change = round(price - prev, 2)
+        change_pct = round((change / prev * 100), 2) if prev else 0
+        indicators = result.get('indicators', {}).get('quote', [{}])[0]
+        volumes = indicators.get('volume', [])
+        opens = indicators.get('open', [])
+        highs = indicators.get('high', [])
+        lows = indicators.get('low', [])
+        vol = volumes[-1] if volumes and volumes[-1] else 0
+        op = opens[-1] if opens and opens[-1] else price
+        hi = highs[-1] if highs and highs[-1] else price
+        lo = lows[-1] if lows and lows[-1] else price
+        name = meta.get('shortName', meta.get('symbol', code))
+        name = name.replace('.TW', '').replace('.TWO', '').strip()
+        return {
+            'code': code, 'name': name,
+            'price': price, 'yesterday': prev,
+            'change': change, 'change_pct': change_pct,
+            'open': str(round(op, 2)), 'high': str(round(hi, 2)), 'low': str(round(lo, 2)),
+            'volume': str(int(vol / 1000)) if vol else '-',
+            'time': '', 'market': market,
+            'limit_up': '-', 'limit_down': '-',
+            'best_bid': '-', 'best_ask': '-',
+        }
+    except Exception:
+        return None
+
 def fetch_stocks(code_market_pairs):
     if not code_market_pairs:
         return []
+    # Try TWSE API first
     ex_ch = '|'.join([f'{m}_{c}.tw' for c, m in code_market_pairs])
     data = cached_get(f'{API_BASE}?ex_ch={ex_ch}')
     results = []
@@ -103,6 +144,12 @@ def fetch_stocks(code_market_pairs):
         s = parse_stock(item)
         if s and s['code']:
             results.append(s)
+    # Fallback to Yahoo Finance if TWSE returned nothing (cloud deploy outside Taiwan)
+    if not results and code_market_pairs:
+        for code, market in code_market_pairs:
+            s = fetch_stock_yahoo(code, market)
+            if s:
+                results.append(s)
     return results
 
 @app.route('/')
@@ -161,6 +208,32 @@ def market_summary():
             result['tse'] = s
         elif item.get('c') == 'o00':
             result['otc'] = s
+    # Yahoo Finance fallback for indices
+    if 'tse' not in result or 'otc' not in result:
+        for sym, key, name in [('%5ETWII', 'tse', '加權指數'), ('%5ETWO', 'otc', '櫃買指數')]:
+            if key in result:
+                continue
+            try:
+                url = f'https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=5d'
+                d = cached_get(url, ttl=30)
+                meta = d.get('chart', {}).get('result', [{}])[0].get('meta', {})
+                price = meta.get('regularMarketPrice')
+                prev = meta.get('chartPreviousClose') or meta.get('previousClose')
+                if price and prev:
+                    price, prev = float(price), float(prev)
+                    chg = round(price - prev, 2)
+                    pct = round((chg / prev * 100), 2) if prev else 0
+                    result[key] = {
+                        'code': 't00' if key == 'tse' else 'o00', 'name': name,
+                        'price': price, 'yesterday': prev,
+                        'change': chg, 'change_pct': pct,
+                        'open': '-', 'high': '-', 'low': '-', 'volume': '-',
+                        'time': '', 'market': key,
+                        'limit_up': '-', 'limit_down': '-',
+                        'best_bid': '-', 'best_ask': '-',
+                    }
+            except Exception:
+                pass
     return jsonify(result)
 
 @app.route('/api/top_movers')
@@ -230,6 +303,36 @@ def historical():
                     })
         except Exception:
             continue
+
+    # Yahoo Finance fallback for historical data
+    if not all_data:
+        try:
+            suffix = '.TW' if market == 'tse' else '.TWO'
+            period = f'{months}mo' if months <= 6 else '1y'
+            url = f'https://query1.finance.yahoo.com/v8/finance/chart/{code}{suffix}?interval=1d&range={period}'
+            d = cached_get(url, ttl=3600)
+            result = d.get('chart', {}).get('result', [{}])[0]
+            timestamps = result.get('timestamp', [])
+            quotes = result.get('indicators', {}).get('quote', [{}])[0]
+            for i, ts in enumerate(timestamps):
+                try:
+                    dt = datetime.datetime.fromtimestamp(ts)
+                    o = quotes.get('open', [])[i]
+                    h = quotes.get('high', [])[i]
+                    l = quotes.get('low', [])[i]
+                    c = quotes.get('close', [])[i]
+                    v = quotes.get('volume', [])[i]
+                    if o and h and l and c:
+                        all_data.append({
+                            'date': dt.strftime('%Y-%m-%d'),
+                            'open': round(float(o), 2), 'high': round(float(h), 2),
+                            'low': round(float(l), 2), 'close': round(float(c), 2),
+                            'volume': int(v) if v else 0,
+                        })
+                except (IndexError, TypeError):
+                    continue
+        except Exception:
+            pass
 
     all_data.sort(key=lambda x: x['date'])
     seen = set()
