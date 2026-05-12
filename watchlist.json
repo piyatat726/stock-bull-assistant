@@ -1,0 +1,32 @@
+[
+  {
+    "code": "2330",
+    "name": "台積電",
+    "market": "tse"
+  },
+  {
+    "code": "3450",
+    "name": "聯鈞",
+    "market": "tse"
+  },
+  {
+    "code": "1723",
+    "name": "中碳",
+    "market": "tse"
+  },
+  {
+    "code": "6788",
+    "name": "華景電",
+    "market": "otc"
+  },
+  {
+    "code": "6770",
+    "name": "力積電",
+    "market": "tse"
+  },
+  {
+    "code": "6217",
+    "name": "中探針",
+    "market": "otc"
+  }
+]
