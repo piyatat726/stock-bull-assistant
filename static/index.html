@@ -504,8 +504,9 @@ let WL=[], tvChart=null, tvSeries=null, tvVolume=null, tvMaSeries=[], histData=[
 const $=id=>document.getElementById(id);
 const cc=c=>c>0?'up':c<0?'down':'flat';
 const sg=v=>v>0?'+':'';
-const fm=n=>n?Number(n).toLocaleString():'-';
-const fmk=n=>{if(!n)return'-';n=Number(n);return n>=1e8?(n/1e8).toFixed(1)+'億':n>=1e4?(n/1e4).toFixed(0)+'萬':fm(n)};
+const fm=n=>(n===null||n===undefined||n===''||n==='-')?'-':Number(n).toLocaleString();
+const fp=v=>{if(!v||v==='-')return'-';const n=parseFloat(v);return isNaN(n)?v:String(n)};
+const fmk=n=>{if(n===null||n===undefined||n===''||n==='-')return'-';n=Number(n);return n>=1e8?(n/1e8).toFixed(1)+'億':n>=1e4?(n/1e4).toFixed(0)+'萬':fm(n)};
 
 // Time
 let marketOpen=false;
@@ -620,9 +621,9 @@ async function loadWL(){
       <div class="top"><div><div class="nm">${s.name}</div><div class="cd">${s.code} · ${s.market==='otc'?'櫃':'市'}</div></div><div class="pr">${s.price}${closedTag}</div></div>
       <div><span class="ctag">${sg(s.change)}${s.change} (${sg(s.change_pct)}${s.change_pct}%)</span></div>
       <div class="dets">
-        <div class="det"><span class="dl">開</span><span>${s.open}</span></div>
-        <div class="det"><span class="dl">高</span><span>${s.high}</span></div>
-        <div class="det"><span class="dl">低</span><span>${s.low}</span></div>
+        <div class="det"><span class="dl">開</span><span>${fp(s.open)}</span></div>
+        <div class="det"><span class="dl">高</span><span>${fp(s.high)}</span></div>
+        <div class="det"><span class="dl">低</span><span>${fp(s.low)}</span></div>
         <div class="det"><span class="dl">量</span><span>${fm(s.volume)}</span></div>
       </div></div>`}).join('');
     updateChSel();
@@ -722,19 +723,21 @@ async function loadPortfolio(){
     const dayChg=s.change||0;
     const dayPnl=shares>0?dayChg*shares:0;
     tc+=inv;tv+=val;tdp+=dayPnl;
-    const c=pnl>=0?'up':'down';
-    const dc=dayChg>=0?'up':'down';
+    const c=cc(pnl);
+    const dc=cc(dayChg);
+    const dayPnlC=shares>0?cc(dayPnl):'flat';
+    const pnlC=inv>0?cc(pnl):'flat';
     const placeholder=pUnit==='stock'?'如 500':'如 1';
     return`<tr><td><strong>${s.name}</strong> <span style="color:var(--dim);font-size:11px">${s.code}</span></td><td>${s.price}</td>
     <td class="${dc}" style="font-size:12px;white-space:nowrap">${dayChg>0?'+':''}${dayChg.toFixed(2)} (${s.change_pct>0?'+':''}${s.change_pct}%)</td>
     <td><input class="pinp" value="${p.cost}" onchange="upP('${s.code}','cost',this.value)" placeholder="0"></td>
     <td><input class="pinp" value="${p.qty}" onchange="upP('${s.code}','qty',this.value)" placeholder="${placeholder}" style="width:90px"></td>
     <td>${inv>0?fm(Math.round(inv)):'-'}</td><td>${val>0?fm(Math.round(val)):'-'}</td>
-    <td class="${dc}" style="font-weight:700">${shares>0?(dayPnl>0?'+':'')+(Math.round(dayPnl)).toLocaleString():'-'}</td>
-    <td class="${c}" style="font-weight:700">${inv>0?(pnl>0?'+':'')+(Math.round(pnl)).toLocaleString():'-'}</td>
-    <td class="${c}" style="font-weight:700">${inv>0?(pct>=0?'+':'')+pct.toFixed(2)+'%':'-'}</td>
+    <td class="${dayPnlC}" style="font-weight:700">${shares>0?(dayPnl>0?'+':'')+(Math.round(dayPnl)).toLocaleString():'-'}</td>
+    <td class="${pnlC}" style="font-weight:700">${inv>0?(pnl>0?'+':'')+(Math.round(pnl)).toLocaleString():'-'}</td>
+    <td class="${pnlC}" style="font-weight:700">${inv>0?(pct>=0?'+':'')+pct.toFixed(2)+'%':'-'}</td>
     <td><button class="alert-del" onclick="rmPStock('${s.code}')" title="移除持股">✕</button></td></tr>`}).join('');
-  const tp=tv-tc,tpct=tc>0?(tp/tc*100):0,c=tp>=0?'up':'down',dpc=tdp>=0?'up':'down';
+  const tp=tv-tc,tpct=tc>0?(tp/tc*100):0,c=cc(tp),dpc=cc(tdp);
   $('p-total').innerHTML=`
     <div class="ptotal-card"><div class="sl">總成本</div><div class="sv">${fm(Math.round(tc))}</div></div>
     <div class="ptotal-card"><div class="sl">總市值</div><div class="sv">${fm(Math.round(tv))}</div></div>
@@ -898,9 +901,9 @@ async function loadInst(){
         const fn=Math.round(i.foreign_net/1000),tn=Math.round(i.trust_net/1000),dn=Math.round(i.dealer_net/1000),tot=Math.round(i.total_net/1000);
         const c=tot>0?'up':'down';
         return`<tr><td><strong>${i.name}</strong><br><span style="color:var(--dim);font-size:10px">${i.code}</span></td>
-        <td class="${fn>=0?'up':'down'}">${sg(fn)}${fm(fn)}</td>
-        <td class="${tn>=0?'up':'down'}">${sg(tn)}${fm(tn)}</td>
-        <td class="${dn>=0?'up':'down'}">${sg(dn)}${fm(dn)}</td>
+        <td class="${cc(fn)}">${fn!==0?sg(fn)+fm(fn):'-'}</td>
+        <td class="${cc(tn)}">${tn!==0?sg(tn)+fm(tn):'-'}</td>
+        <td class="${cc(dn)}">${dn!==0?sg(dn)+fm(dn):'-'}</td>
         <td class="${c}" style="font-weight:700">${sg(tot)}${fm(tot)}</td></tr>`}).join('')};
     render(d.top_buy||[],'ib');render(d.top_sell||[],'is');
   }catch(e){}
@@ -943,9 +946,9 @@ async function searchStock(){
       </div>
       <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">
         <div><div style="color:var(--dim);font-size:11px">昨收</div><div style="font-weight:700">${s.yesterday}</div></div>
-        <div><div style="color:var(--dim);font-size:11px">開盤</div><div style="font-weight:700">${s.open}</div></div>
-        <div><div style="color:var(--dim);font-size:11px">最高</div><div style="font-weight:700">${s.high}</div></div>
-        <div><div style="color:var(--dim);font-size:11px">最低</div><div style="font-weight:700">${s.low}</div></div>
+        <div><div style="color:var(--dim);font-size:11px">開盤</div><div style="font-weight:700">${fp(s.open)}</div></div>
+        <div><div style="color:var(--dim);font-size:11px">最高</div><div style="font-weight:700">${fp(s.high)}</div></div>
+        <div><div style="color:var(--dim);font-size:11px">最低</div><div style="font-weight:700">${fp(s.low)}</div></div>
       </div>
       <div style="margin-top:10px"><button class="btn" onclick="$('add-input').value='${s.code}';document.querySelector('[data-page=overview]').click();setTimeout(addStock,100)">+ 加入關注</button></div>
     </div>`;
@@ -1103,9 +1106,9 @@ async function loadETF(){
         <div class="top"><div><div class="nm">${s.name}</div><div class="cd">${s.code} · ETF</div></div><div class="pr">${s.price}${closedTag}</div></div>
         <div><span class="ctag">${sg(s.change)}${s.change} (${sg(s.change_pct)}${s.change_pct}%)</span></div>
         <div class="dets">
-          <div class="det"><span class="dl">開</span><span>${s.open}</span></div>
-          <div class="det"><span class="dl">高</span><span>${s.high}</span></div>
-          <div class="det"><span class="dl">低</span><span>${s.low}</span></div>
+          <div class="det"><span class="dl">開</span><span>${fp(s.open)}</span></div>
+          <div class="det"><span class="dl">高</span><span>${fp(s.high)}</span></div>
+          <div class="det"><span class="dl">低</span><span>${fp(s.low)}</span></div>
           <div class="det"><span class="dl">量</span><span>${fm(s.volume)}</span></div>
         </div></div>`}).join(''):'<div class="loading">暫無 ETF 資料</div>';
   }catch(e){$('etf-grid').innerHTML='<div class="loading">載入失敗</div>'}
