@@ -177,6 +177,11 @@ def fetch_stocks(code_market_pairs):
             s = fetch_stock_yahoo(code, market)
             if s:
                 results.append(s)
+    # Always apply Chinese name mapping (ensures cloud version shows Chinese)
+    for r in results:
+        cn = STOCK_NAMES.get(r['code']) or _name_cache.get(r['code'])
+        if cn:
+            r['name'] = cn
     return results
 
 @app.route('/')
