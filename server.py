@@ -3,6 +3,7 @@ import json, datetime, time, threading, requests, os, subprocess, re
 from flask import Flask, jsonify, send_from_directory, request
 
 app = Flask(__name__, static_folder='static')
+APP_VERSION = 'v3'  # deploy check marker
 
 WATCHLIST_FILE = 'watchlist.json'
 TUNNEL_URL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tunnel_url.txt')
@@ -187,6 +188,10 @@ def fetch_stocks(code_market_pairs):
 @app.route('/')
 def index():
     return send_from_directory('static', 'index.html')
+
+@app.route('/api/version')
+def version():
+    return jsonify({'version': APP_VERSION, 'names_count': len(STOCK_NAMES)})
 
 @app.route('/api/watchlist', methods=['GET'])
 def get_watchlist():

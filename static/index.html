@@ -378,6 +378,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Display','Segoe UI',sa
       </div>
     </div>
     <div id="tv-chart"></div>
+    <div id="chart-update-time" style="text-align:right;font-size:10px;color:var(--dim);margin-top:4px;min-height:14px"></div>
   </div>
   <div class="stitle">📐 技術指標</div>
   <div class="ind-grid" id="inds"></div>
@@ -782,7 +783,11 @@ function checkAlerts(stocks){
 
 // Chart (TradingView Lightweight Charts)
 function updateChSel(){
+  const prev=$('ch-sel').value;
   $('ch-sel').innerHTML=WL.map(w=>`<option value="${w.code}" data-market="${w.market||'tse'}">${w.name} ${w.code}</option>`).join('');
+  if(prev)$('ch-sel').value=prev;
+  // Auto-load chart if on chart page and chart hasn't loaded yet
+  if($('page-chart').classList.contains('active')&&!tvChart&&$('ch-sel').value)loadChart();
 }
 function setChartPeriod(m){
   chartMonths=m;
@@ -790,9 +795,14 @@ function setChartPeriod(m){
   loadChart();
 }
 async function loadChart(){
-  const sel=$('ch-sel');if(!sel.value)return;
+  const sel=$('ch-sel');
+  if(!sel.value){
+    $('tv-chart').innerHTML='<div class="loading" style="padding:40px;text-align:center;color:var(--dim)">📈 載入中...</div>';
+    return;
+  }
   const code=sel.value,market=sel.options[sel.selectedIndex].dataset.market||'tse';
   const isDark=document.documentElement.dataset.theme==='dark';
+  $('tv-chart').innerHTML='<div class="loading" style="padding:40px;text-align:center;color:var(--dim)">⏳ 載入 K 線資料...</div>';
 
   try{
     const r=await fetch(`/api/historical?code=${code}&market=${market}&months=${chartMonths}`);
@@ -800,8 +810,9 @@ async function loadChart(){
     if(!histData.length){$('inds').innerHTML='<div class="loading">無歷史資料</div>';return}
 
     $('tv-chart').innerHTML='';
+    const chartH=$('tv-chart').clientHeight||400;
     tvChart=LightweightCharts.createChart($('tv-chart'),{
-      width:$('tv-chart').clientWidth, height:400,
+      width:$('tv-chart').clientWidth, height:chartH,
       layout:{background:{type:'solid',color:isDark?'#111827':'#ffffff'},textColor:isDark?'#6b7fa3':'#6b7280'},
       grid:{vertLines:{color:isDark?'rgba(255,255,255,.03)':'rgba(0,0,0,.04)'},horzLines:{color:isDark?'rgba(255,255,255,.03)':'rgba(0,0,0,.04)'}},
       crosshair:{mode:0},
@@ -836,7 +847,7 @@ async function loadChart(){
     }
 
     tvChart.timeScale().fitContent();
-    new ResizeObserver(()=>{if(tvChart)tvChart.applyOptions({width:$('tv-chart').clientWidth})}).observe($('tv-chart'));
+    new ResizeObserver(()=>{if(tvChart)tvChart.applyOptions({width:$('tv-chart').clientWidth,height:$('tv-chart').clientHeight||chartH})}).observe($('tv-chart'));
     calcInds(closes);
     startChartUpdate();
   }catch(e){$('inds').innerHTML='<div class="loading">載入失敗</div>'}
@@ -1137,7 +1148,11 @@ let chartUpdateTimer=null;
 function startChartUpdate(){stopChartUpdate();chartUpdateTimer=setInterval(updateChartRealtime,8000)}
 function stopChartUpdate(){if(chartUpdateTimer){clearInterval(chartUpdateTimer);chartUpdateTimer=null}}
 async function updateChartRealtime(){
-  if(!tvSeries||!tvChart)return;
+  if(!tvSeries||!tvChart){
+    // Chart not initialized yet — try loading if select has value
+    if($('ch-sel')&&$('ch-sel').value&&$('page-chart').classList.contains('active'))loadChart();
+    return;
+  }
   const sel=$('ch-sel');if(!sel||!sel.value)return;
   const code=sel.value,market=sel.options[sel.selectedIndex].dataset.market||'tse';
   try{
@@ -1149,8 +1164,14 @@ async function updateChartRealtime(){
       const op=parseFloat(s.open)||s.price,hi=parseFloat(s.high)||s.price,lo=parseFloat(s.low)||s.price;
       tvSeries.update({time:dateStr,open:op,high:hi,low:lo,close:s.price});
       if(tvVolume)tvVolume.update({time:dateStr,value:(parseInt(s.volume)||0)*1000,color:s.price>=op?'rgba(255,77,106,.3)':'rgba(0,214,143,.3)'});
+      // Show last update time
+      const tEl=$('chart-update-time');
+      if(tEl)tEl.textContent=`最後更新: ${now.getHours()}:${String(now.getMinutes()).padStart(2,'0')}:${String(now.getSeconds()).padStart(2,'0')} | ${s.name} ${s.price}`;
     }
-  }catch(e){}
+  }catch(e){
+    const tEl=$('chart-update-time');
+    if(tEl)tEl.textContent='更新失敗，重試中...';
+  }
 }
 
 function refreshAll(){
