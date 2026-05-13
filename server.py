@@ -35,6 +35,29 @@ POPULAR_OTC = ['6788','3105','6547','5765','4966','3293','6510','8069','6679','5
 POPULAR_ETF = [('0050','tse'),('0056','tse'),('00878','tse'),('00919','tse'),
                ('00929','tse'),('006208','tse'),('00713','tse'),('00940','tse')]
 
+# Chinese name mapping (Yahoo Finance only returns English names)
+STOCK_NAMES = {
+    '2330':'台積電','2317':'鴻海','2454':'聯發科','2308':'台達電',
+    '2882':'國泰金','2881':'富邦金','2891':'中信金','3711':'日月光投控',
+    '2303':'聯電','2002':'中鋼','1301':'台塑','1303':'南亞',
+    '2412':'中華電','3008':'大立光','2886':'兆豐金','6505':'台塑化',
+    '1326':'台化','2357':'華碩','5880':'合庫金','2892':'第一金',
+    '3034':'聯詠','2327':'國巨','4938':'和碩','3231':'緯創',
+    '6669':'緯穎','2345':'智邦','3037':'欣興','2474':'可成',
+    '1723':'中碳','3450':'聯鈞','2382':'廣達','2395':'研華',
+    '3443':'創意','2603':'長榮','2609':'陽明','2615':'萬海',
+    '4904':'遠傳','2105':'正新','1216':'統一','2207':'和泰車',
+    '6788':'華景電','3105':'穩懋','6547':'高端疫苗','4966':'譜瑞-KY',
+    '3293':'鈊象','6510':'精測','8069':'元太','6679':'鈺太',
+    '5904':'寶雅','6426':'統新光訊','3529':'力旺','6180':'橘子',
+    '8044':'網家','4763':'材料-KY','6770':'力積電','5289':'宜鼎',
+    '6592':'和潤企業','3707':'漢磊','6781':'AES-KY','5765':'泰博',
+    '0050':'元大台灣50','0056':'元大高股息','00878':'國泰永續高股息',
+    '00919':'群益台灣精選高息','00929':'復華台灣科技優息',
+    '006208':'富邦台50','00713':'元大台灣高息低波','00940':'元大台灣價值高息',
+}
+_name_cache = {}  # dynamic cache from TWSE responses
+
 def cached_get(url, ttl=CACHE_TTL):
     now = time.time()
     if url in cache and now - cache[url]['t'] < ttl:
@@ -79,8 +102,12 @@ def parse_stock(item):
             hi = str(current)
         if lo == '-' and current > 0:
             lo = str(current)
+        code = item.get('c', '')
+        name = item.get('n', '')
+        if code and name:
+            _name_cache[code] = name
         return {
-            'code': item.get('c', ''), 'name': item.get('n', ''),
+            'code': code, 'name': name,
             'price': current, 'yesterday': yesterday,
             'change': round(change, 2), 'change_pct': round(change_pct, 2),
             'open': op, 'high': hi, 'low': lo,
@@ -118,8 +145,8 @@ def fetch_stock_yahoo(code, market='tse'):
         op = opens[-1] if opens and opens[-1] else price
         hi = highs[-1] if highs and highs[-1] else price
         lo = lows[-1] if lows and lows[-1] else price
-        name = meta.get('shortName', meta.get('symbol', code))
-        name = name.replace('.TW', '').replace('.TWO', '').strip()
+        name = STOCK_NAMES.get(code) or _name_cache.get(code) or meta.get('shortName', meta.get('symbol', code))
+        if name: name = name.replace('.TW', '').replace('.TWO', '').strip()
         return {
             'code': code, 'name': name,
             'price': price, 'yesterday': prev,
@@ -158,7 +185,11 @@ def index():
 
 @app.route('/api/watchlist', methods=['GET'])
 def get_watchlist():
-    return jsonify(load_watchlist())
+    wl = load_watchlist()
+    for w in wl:
+        if w.get('code') and w.get('name'):
+            _name_cache[w['code']] = w['name']
+    return jsonify(wl)
 
 @app.route('/api/watchlist/add', methods=['POST'])
 def add_to_watchlist():
