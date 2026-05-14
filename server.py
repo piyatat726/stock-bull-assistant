@@ -204,7 +204,14 @@ def index():
 
 @app.route('/api/version')
 def version():
-    return jsonify({'version': APP_VERSION, 'names_count': len(STOCK_NAMES)})
+    test_code = request.args.get('test', '2317')
+    return jsonify({
+        'version': APP_VERSION,
+        'names_count': len(STOCK_NAMES),
+        'test_lookup': STOCK_NAMES.get(test_code, 'NOT_FOUND'),
+        'cache_lookup': _name_cache.get(test_code, 'NOT_IN_CACHE'),
+        'stock_names_keys_sample': list(STOCK_NAMES.keys())[:10],
+    })
 
 @app.route('/api/watchlist', methods=['GET'])
 def get_watchlist():
