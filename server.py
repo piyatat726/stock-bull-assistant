@@ -311,11 +311,59 @@ def search_stock():
     query = request.args.get('q', '').strip()
     if not query:
         return jsonify([])
+    # 1. If query is a stock code (digits), search directly
+    if query.isdigit() or query.startswith('00'):
+        for market in ['tse', 'otc']:
+            results = fetch_stocks([(query, market)])
+            if results and results[0].get('name'):
+                return jsonify(results)
+    # 2. If query is a Chinese name, look up code from NAME_TO_CODE or STOCK_NAMES
+    code = NAME_TO_CODE.get(query)
+    if code:
+        for market in ['tse', 'otc']:
+            results = fetch_stocks([(code, market)])
+            if results and results[0].get('name'):
+                return jsonify(results)
+    # 3. Partial name match — search through STOCK_NAMES and _name_cache
+    matches = []
+    all_names = {**STOCK_NAMES, **{v: k for k, v in _name_cache.items() if k not in STOCK_NAMES}}
+    for code, name in STOCK_NAMES.items():
+        if query in name or query in code:
+            matches.append((code, name))
+    for code, name in _name_cache.items():
+        if code not in STOCK_NAMES and (query in name or query in code):
+            matches.append((code, name))
+    if matches:
+        # Fetch real-time data for first 5 matches
+        pairs = []
+        for code, name in matches[:5]:
+            market = 'otc' if code in [c for c in POPULAR_OTC] else 'tse'
+            pairs.append((code, market))
+        results = []
+        for code, market in pairs:
+            r = fetch_stocks([(code, market)])
+            if r:
+                results.extend(r)
+        if results:
+            return jsonify(results)
+    # 4. Fallback: try as stock code on both markets
     for market in ['tse', 'otc']:
         results = fetch_stocks([(query, market)])
         if results and results[0].get('name'):
             return jsonify(results)
     return jsonify([])
+
+@app.route('/api/stock_list')
+def stock_list():
+    """Return all known stocks for autocomplete/browsing"""
+    stocks = []
+    for code, name in STOCK_NAMES.items():
+        market = 'otc' if code in POPULAR_OTC else 'tse'
+        stocks.append({'code': code, 'name': name, 'market': market})
+    for code, name in _name_cache.items():
+        if code not in STOCK_NAMES:
+            stocks.append({'code': code, 'name': name, 'market': 'tse'})
+    return jsonify(stocks)
 
 @app.route('/api/historical')
 def historical():

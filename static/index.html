@@ -106,6 +106,23 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Display','Segoe UI',sa
 .ind-box .iv{font-size:15px;font-weight:800;margin-top:2px}
 .ind-box .is{font-size:9px;margin-top:2px}
 
+.s-chip{display:inline-block;padding:5px 12px;border-radius:20px;border:1px solid var(--border);background:var(--bg2);color:var(--text);font-size:12px;cursor:pointer;transition:all .2s;white-space:nowrap}
+.s-chip:hover,.s-chip:active{background:var(--gold);color:#000;border-color:var(--gold)}
+.s-chip .sc{color:var(--dim);font-size:10px;margin-left:3px}
+.suggest-item{padding:10px 14px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--border);transition:background .15s}
+.suggest-item:hover,.suggest-item:active{background:var(--bg2)}
+.suggest-item:last-child{border-bottom:none}
+.suggest-item .sn{font-weight:700;font-size:13px}
+.suggest-item .sc{color:var(--dim);font-size:11px;margin-left:6px}
+.suggest-item .sm{font-size:10px;color:var(--dim);background:var(--bg2);padding:2px 6px;border-radius:4px}
+.search-card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px;margin-bottom:12px;box-shadow:var(--shadow)}
+.search-card .sh{display:flex;justify-content:space-between;align-items:flex-start}
+.search-card .sn{font-size:18px;font-weight:800}
+.search-card .sp{font-size:26px;font-weight:800}
+.search-card .sd{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:12px;padding-top:12px;border-top:1px solid var(--border)}
+.search-card .sd .dl{color:var(--dim);font-size:11px}
+.search-card .sd .dv{font-weight:700}
+
 .ptable{width:100%;border-collapse:separate;border-spacing:0;background:var(--card);border-radius:10px;overflow:hidden;border:1px solid var(--border)}
 .ptable th,.ptable td{padding:10px 12px;font-size:12px;text-align:right;border-bottom:1px solid var(--border)}
 .ptable th{background:var(--bg2);color:var(--dim);font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:.3px}
@@ -491,8 +508,18 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Display','Segoe UI',sa
 
 <div class="page" id="page-search">
   <div class="stitle">🔍 查詢台股（上市 + 上櫃）</div>
-  <div class="addbar"><input class="inp" id="s-inp" placeholder="輸入股票代碼" style="max-width:250px" onkeypress="if(event.key==='Enter')searchStock()"><button class="btn" onclick="searchStock()">查詢</button></div>
+  <div class="addbar" style="position:relative">
+    <input class="inp" id="s-inp" placeholder="輸入代碼或名稱，例如：2330、台積電" style="flex:1;max-width:350px" oninput="onSearchInput()" onkeypress="if(event.key==='Enter'){closeSuggest();searchStock()}" onfocus="onSearchInput()" autocomplete="off">
+    <button class="btn" onclick="closeSuggest();searchStock()">查詢</button>
+    <div id="s-suggest" style="display:none;position:absolute;top:100%;left:0;right:0;max-width:350px;background:var(--card);border:1px solid var(--border);border-radius:8px;box-shadow:var(--shadow);max-height:240px;overflow-y:auto;z-index:999;margin-top:4px"></div>
+  </div>
   <div class="search-res" id="s-res"></div>
+  <div id="s-popular" style="margin-top:16px">
+    <div class="stitle" style="font-size:13px">🔥 熱門股票</div>
+    <div id="s-hot" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px"></div>
+    <div class="stitle" style="font-size:13px;margin-top:16px">📊 熱門 ETF</div>
+    <div id="s-hot-etf" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px"></div>
+  </div>
 </div>
 
 </div>
@@ -559,6 +586,7 @@ document.querySelectorAll('.tab').forEach(t=>t.addEventListener('click',()=>{
   if(pg==='portfolio')loadPortfolio();
   if(pg==='alerts')renderAlerts();
   if(pg==='momentum')loadMomentum();
+  if(pg==='search'){$('s-popular').style.display='block';$('s-res').style.display='none';$('s-inp').focus()}
 }));
 
 // Greeting
@@ -942,29 +970,105 @@ async function loadDiv(){
 }
 
 // Search
+// Stock list cache for autocomplete
+let stockListCache=null;
+async function loadStockList(){
+  if(stockListCache)return stockListCache;
+  try{const r=await fetch('/api/stock_list');stockListCache=await r.json();return stockListCache}catch(e){return []}
+}
+loadStockList(); // preload
+
+let suggestTimer=null;
+function onSearchInput(){
+  clearTimeout(suggestTimer);
+  suggestTimer=setTimeout(showSuggest,150);
+}
+async function showSuggest(){
+  const q=$('s-inp').value.trim();
+  const box=$('s-suggest');
+  if(!q){box.style.display='none';return}
+  const list=await loadStockList();
+  const matches=list.filter(s=>s.code.includes(q)||s.name.includes(q)).slice(0,8);
+  if(!matches.length){box.style.display='none';return}
+  box.innerHTML=matches.map(s=>`<div class="suggest-item" onmousedown="pickSuggest('${s.code}')">
+    <div><span class="sn">${s.name}</span><span class="sc">${s.code}</span></div>
+    <span class="sm">${s.market==='otc'?'櫃':'市'}</span>
+  </div>`).join('');
+  box.style.display='block';
+}
+function closeSuggest(){$('s-suggest').style.display='none'}
+function pickSuggest(code){$('s-inp').value=code;closeSuggest();searchStock()}
+document.addEventListener('click',e=>{if(!e.target.closest('#s-inp')&&!e.target.closest('#s-suggest'))closeSuggest()});
+
+function renderSearchCard(s){
+  const c=cc(s.change);
+  const inWL=WL.some(w=>w.code===s.code);
+  return`<div class="search-card ${c}">
+    <div class="sh">
+      <div><div class="sn">${s.name}</div><div style="color:var(--dim);font-size:12px">${s.code} · ${s.market==='otc'?'上櫃':'上市'}</div></div>
+      <div style="text-align:right"><div class="sp">${s.price}</div><span class="ctag">${sg(s.change)}${s.change} (${sg(s.change_pct)}${s.change_pct}%)</span></div>
+    </div>
+    <div class="sd">
+      <div><div class="dl">昨收</div><div class="dv">${s.yesterday}</div></div>
+      <div><div class="dl">開盤</div><div class="dv">${fp(s.open)}</div></div>
+      <div><div class="dl">高</div><div class="dv">${fp(s.high)}</div></div>
+      <div><div class="dl">低</div><div class="dv">${fp(s.low)}</div></div>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:12px">
+      ${inWL?'<button class="btn" style="background:var(--bg2);color:var(--dim);cursor:default">已在關注清單</button>'
+        :`<button class="btn" onclick="addFromSearch('${s.code}','${s.name}','${s.market}')">+ 加入關注</button>`}
+      <button class="btn" style="background:var(--bg2);color:var(--text)" onclick="viewChart('${s.code}','${s.name}','${s.market}')">📈 K線</button>
+    </div>
+  </div>`
+}
+
 async function searchStock(){
   const q=$('s-inp').value.trim();if(!q)return;
   const box=$('s-res');box.style.display='block';
+  $('s-popular').style.display='none';
   box.innerHTML='<div class="loading"><span class="spin">↻</span> 查詢中...</div>';
   try{
-    const r=await fetch(`/api/search?q=${q}`);const stocks=await r.json();
-    if(!stocks.length){box.innerHTML=`<div style="color:var(--dim)">找不到 ${q}</div>`;return}
-    const s=stocks[0];const c=cc(s.change);
-    box.innerHTML=`<div class="${c}">
-      <div style="display:flex;justify-content:space-between;align-items:flex-start">
-        <div><div style="font-size:18px;font-weight:800">${s.name}</div><div style="color:var(--dim);font-size:12px">${s.code} · ${s.market==='otc'?'上櫃':'上市'}</div></div>
-        <div style="text-align:right"><div style="font-size:26px;font-weight:800">${s.price}</div><span class="ctag">${sg(s.change)}${s.change} (${sg(s.change_pct)}${s.change_pct}%)</span></div>
-      </div>
-      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">
-        <div><div style="color:var(--dim);font-size:11px">昨收</div><div style="font-weight:700">${s.yesterday}</div></div>
-        <div><div style="color:var(--dim);font-size:11px">開盤</div><div style="font-weight:700">${fp(s.open)}</div></div>
-        <div><div style="color:var(--dim);font-size:11px">最高</div><div style="font-weight:700">${fp(s.high)}</div></div>
-        <div><div style="color:var(--dim);font-size:11px">最低</div><div style="font-weight:700">${fp(s.low)}</div></div>
-      </div>
-      <div style="margin-top:10px"><button class="btn" onclick="$('add-input').value='${s.code}';document.querySelector('[data-page=overview]').click();setTimeout(addStock,100)">+ 加入關注</button></div>
-    </div>`;
+    const r=await fetch(`/api/search?q=${encodeURIComponent(q)}`);const stocks=await r.json();
+    if(!stocks.length){box.innerHTML=`<div style="color:var(--dim);padding:20px;text-align:center">找不到「${q}」<br><span style="font-size:12px">試試輸入股票代碼（如 2330）或名稱（如 台積電）</span></div>`;return}
+    box.innerHTML=stocks.map(s=>renderSearchCard(s)).join('');
   }catch(e){box.innerHTML='<div style="color:var(--red)">查詢失敗</div>'}
 }
+
+function addFromSearch(code,name,market){
+  fetch('/api/watchlist/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code,name,market})})
+    .then(r=>r.json()).then(d=>{
+      if(d.ok){toast(`已加入 ${name}(${code})`,'success');loadWL();searchStock()}
+      else toast(d.error||'加入失敗','error')
+    }).catch(()=>toast('加入失敗','error'));
+}
+
+function viewChart(code,name,market){
+  // Add to chart select and switch to chart page
+  const sel=$('ch-sel');
+  if(![...sel.options].some(o=>o.value===code)){
+    sel.add(new Option(`${name} ${code}`,code));
+    sel.options[sel.options.length-1].dataset.market=market;
+  }
+  sel.value=code;
+  document.querySelector('[data-page=chart]').click();
+}
+
+// Populate hot stocks on search page
+function initSearchPage(){
+  const hotStocks=[
+    {c:'2330',n:'台積電'},{c:'2317',n:'鴻海'},{c:'2454',n:'聯發科'},{c:'2308',n:'台達電'},
+    {c:'2882',n:'國泰金'},{c:'2881',n:'富邦金'},{c:'3711',n:'日月光'},{c:'2303',n:'聯電'},
+    {c:'2382',n:'廣達'},{c:'3231',n:'緯創'},{c:'2345',n:'智邦'},{c:'2603',n:'長榮'},
+    {c:'8069',n:'元太'},{c:'3034',n:'聯詠'},{c:'2412',n:'中華電'},{c:'1301',n:'台塑'},
+  ];
+  const hotETF=[
+    {c:'0050',n:'元大台灣50'},{c:'0056',n:'元大高股息'},{c:'00878',n:'國泰永續高股息'},
+    {c:'00919',n:'群益精選高息'},{c:'00929',n:'復華科技優息'},{c:'006208',n:'富邦台50'},
+  ];
+  $('s-hot').innerHTML=hotStocks.map(s=>`<span class="s-chip" onclick="$('s-inp').value='${s.c}';searchStock()">${s.n}<span class="sc">${s.c}</span></span>`).join('');
+  $('s-hot-etf').innerHTML=hotETF.map(s=>`<span class="s-chip" onclick="$('s-inp').value='${s.c}';searchStock()">${s.n}<span class="sc">${s.c}</span></span>`).join('');
+}
+initSearchPage();
 
 // Momentum scanner
 async function loadMomentum(){
