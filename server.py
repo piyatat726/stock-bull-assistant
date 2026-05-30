@@ -89,7 +89,12 @@ def parse_stock(item):
     try:
         yesterday = float(item.get('y', '0')) if item.get('y', '-') != '-' else 0
         z_val = item.get('z', '-')
-        current = float(z_val) if z_val and z_val != '-' else yesterday
+        if z_val and z_val != '-':
+            current = float(z_val)
+        else:
+            # During lunch break / pre-market, z is '-'. Use best bid as fallback.
+            bid_str = item.get('b', '').split('_')[0]
+            current = float(bid_str) if bid_str and bid_str != '-' else yesterday
         if current == 0 and yesterday == 0:
             return None
         change = current - yesterday
@@ -355,6 +360,220 @@ def search_stock():
             return jsonify(results)
     return jsonify([])
 
+@app.route('/api/stock_analysis')
+def stock_analysis():
+    """Analyze a single stock and give buy/sell/hold recommendation with commentary"""
+    code = request.args.get('code', '').strip()
+    if not code:
+        return jsonify({'error': 'need code'}), 400
+
+    fund_map = _fetch_pe_pb_yield()
+    rev_map = _fetch_revenue_growth()
+    inst_map = _fetch_institutional()
+
+    fund = fund_map.get(code, {})
+    rev = rev_map.get(code, {})
+    inst = inst_map.get(code)
+
+    pe = fund.get('pe')
+    dy = fund.get('yield')
+    pb = fund.get('pb')
+    yoy = rev.get('yoy')
+    mom = rev.get('mom')
+    rev_amount = rev.get('revenue', 0)
+
+    # Build scores for both directions
+    buy_score = 0
+    sell_score = 0
+    buy_reasons = []
+    sell_reasons = []
+
+    # ── PE ratio ──
+    if pe is not None:
+        if pe < 0:
+            sell_score += 4
+            sell_reasons.append(f'本益比為負 ({pe:.1f})，公司處於虧損狀態')
+        elif pe <= 12:
+            buy_score += 4
+            buy_reasons.append(f'本益比僅 {pe:.1f}，估值極低，具投資價值')
+        elif pe <= 18:
+            buy_score += 3
+            buy_reasons.append(f'本益比 {pe:.1f}，估值合理偏低')
+        elif pe <= 25:
+            buy_score += 1
+        elif pe <= 40:
+            sell_score += 1
+        elif pe > 60:
+            sell_score += 3
+            sell_reasons.append(f'本益比高達 {pe:.1f}，估值偏貴，需留意回檔風險')
+        elif pe > 40:
+            sell_score += 2
+            sell_reasons.append(f'本益比 {pe:.1f}，估值偏高')
+
+    # ── Dividend yield ──
+    if dy is not None:
+        if dy >= 6:
+            buy_score += 4
+            buy_reasons.append(f'殖利率高達 {dy:.1f}%，適合存股族')
+        elif dy >= 4:
+            buy_score += 3
+            buy_reasons.append(f'殖利率 {dy:.1f}%，配息穩定')
+        elif dy >= 2:
+            buy_score += 1
+        elif dy == 0 and pe is not None and pe > 30:
+            sell_score += 2
+            sell_reasons.append('不配息且本益比偏高')
+
+    # ── PB ratio ──
+    if pb is not None:
+        if pb < 1:
+            buy_score += 3
+            buy_reasons.append(f'股價淨值比 {pb:.2f}，低於淨值，股價可能被低估')
+        elif pb < 1.5:
+            buy_score += 2
+            buy_reasons.append(f'股價淨值比 {pb:.2f}，估值偏低')
+        elif pb > 10:
+            sell_score += 3
+            sell_reasons.append(f'淨值比 {pb:.2f}，市場給予極高溢價，風險大')
+        elif pb > 5:
+            sell_score += 2
+            sell_reasons.append(f'淨值比 {pb:.2f}，估值偏高')
+
+    # ── Revenue YoY growth ──
+    if yoy is not None:
+        if yoy >= 50:
+            buy_score += 5
+            buy_reasons.append(f'營收年增 {yoy:+.1f}%，成長力道強勁')
+        elif yoy >= 20:
+            buy_score += 3
+            buy_reasons.append(f'營收年增 {yoy:+.1f}%，穩健成長')
+        elif yoy >= 5:
+            buy_score += 1
+        elif yoy <= -30:
+            sell_score += 5
+            sell_reasons.append(f'營收年減 {yoy:.1f}%，基本面嚴重惡化')
+        elif yoy <= -10:
+            sell_score += 3
+            sell_reasons.append(f'營收年減 {yoy:.1f}%，成長動能轉弱')
+        elif yoy < 0:
+            sell_score += 1
+
+    # ── Revenue MoM growth ──
+    if mom is not None:
+        if mom >= 20:
+            buy_score += 2
+            buy_reasons.append(f'月營收月增 {mom:+.1f}%，近期動能佳')
+        elif mom <= -25:
+            sell_score += 2
+            sell_reasons.append(f'月營收月減 {mom:.1f}%，近期表現疲弱')
+
+    # ── Institutional buying ──
+    if inst:
+        total_lots = inst['total'] // 1000
+        foreign_lots = inst['foreign'] // 1000
+        trust_lots = inst['trust'] // 1000
+        if total_lots > 1000:
+            buy_score += 4
+            buy_reasons.append(f'三大法人大幅買超 {total_lots:,}張，籌碼面佳')
+        elif total_lots > 300:
+            buy_score += 2
+            buy_reasons.append(f'法人買超 {total_lots:,}張')
+        elif total_lots < -1000:
+            sell_score += 4
+            sell_reasons.append(f'三大法人大幅賣超 {abs(total_lots):,}張，籌碼鬆動')
+        elif total_lots < -300:
+            sell_score += 2
+            sell_reasons.append(f'法人賣超 {abs(total_lots):,}張')
+
+        if inst['foreign'] > 0 and inst['trust'] > 0:
+            buy_score += 1
+            buy_reasons.append('外資投信同步看多')
+        elif inst['foreign'] < 0 and inst['trust'] < 0:
+            sell_score += 1
+            sell_reasons.append('外資投信同步看空')
+
+    # ── Determine recommendation ──
+    diff = buy_score - sell_score
+    if diff >= 6:
+        action = 'strong_buy'
+        action_text = '強力買進'
+        action_icon = '🟢'
+    elif diff >= 3:
+        action = 'buy'
+        action_text = '建議買進'
+        action_icon = '🟢'
+    elif diff >= 1:
+        action = 'hold'
+        action_text = '偏多持有'
+        action_icon = '🟡'
+    elif diff >= -1:
+        action = 'hold'
+        action_text = '中性觀望'
+        action_icon = '🟡'
+    elif diff >= -3:
+        action = 'reduce'
+        action_text = '建議減碼'
+        action_icon = '🟠'
+    else:
+        action = 'sell'
+        action_text = '建議賣出'
+        action_icon = '🔴'
+
+    # ── Generate commentary ──
+    commentary = []
+    name = STOCK_NAMES.get(code, code)
+
+    # Overall assessment
+    if action in ('strong_buy', 'buy'):
+        if buy_reasons:
+            commentary.append(f'{name}目前基本面表現良好。')
+    elif action == 'hold':
+        commentary.append(f'{name}目前基本面尚可，建議觀察後續變化再做決定。')
+    elif action in ('reduce', 'sell'):
+        commentary.append(f'{name}目前出現較多警訊，建議留意風險。')
+
+    # Top reasons as commentary
+    for r in buy_reasons[:2]:
+        commentary.append('✅ ' + r + '。')
+    for r in sell_reasons[:2]:
+        commentary.append('⚠️ ' + r + '。')
+
+    # Yield insight
+    if dy is not None and dy >= 4 and action in ('reduce', 'sell'):
+        commentary.append(f'💡 但殖利率仍有 {dy:.1f}%，若為存股策略可考慮續抱。')
+
+    # Revenue trend
+    if yoy is not None and mom is not None:
+        if yoy > 0 and mom < -10:
+            commentary.append('📌 注意月營收出現下滑，需觀察是否為季節性因素。')
+        elif yoy < 0 and mom > 10:
+            commentary.append('📌 月營收回溫中，可能正在築底反轉。')
+
+    has_data = pe is not None or dy is not None or yoy is not None
+    return jsonify({
+        'code': code,
+        'name': name,
+        'has_data': has_data,
+        'action': action,
+        'action_text': action_text,
+        'action_icon': action_icon,
+        'buy_score': buy_score,
+        'sell_score': sell_score,
+        'commentary': ''.join(commentary) if commentary else f'目前無法取得{name}的基本面資料，建議搭配其他資訊判斷。',
+        'pe': round(pe, 1) if pe else None,
+        'pb': round(pb, 2) if pb else None,
+        'dividend_yield': round(dy, 2) if dy else None,
+        'rev_yoy': round(yoy, 1) if yoy else None,
+        'rev_mom': round(mom, 1) if mom else None,
+        'institutional': {
+            'foreign': inst['foreign'] // 1000 if inst else None,
+            'trust': inst['trust'] // 1000 if inst else None,
+            'total': inst['total'] // 1000 if inst else None,
+        } if inst else None,
+        'buy_reasons': buy_reasons,
+        'sell_reasons': sell_reasons,
+    })
+
 @app.route('/api/stock_list')
 def stock_list():
     """Return all known stocks for autocomplete/browsing"""
@@ -480,9 +699,9 @@ def institutional():
                     results.append({
                         'code': row[0].strip(), 'name': row[1].strip(),
                         'foreign_net': int(row[4].replace(',', '')),
-                        'trust_net': int(row[7].replace(',', '')),
-                        'dealer_net': int(row[8].replace(',', '')),
-                        'total_net': int(row[11].replace(',', '')),
+                        'trust_net': int(row[10].replace(',', '')),
+                        'dealer_net': int(row[11].replace(',', '')),
+                        'total_net': int(row[18].replace(',', '')),
                     })
                 except (ValueError, IndexError):
                     continue
@@ -520,7 +739,7 @@ def dividend():
             try:
                 results.append({
                     'date': row[0], 'code': row[1].strip(),
-                    'name': row[2].strip(), 'type': row[3].strip(),
+                    'name': row[2].strip(), 'type': row[6].strip(),
                     'watched': row[1].strip() in wl_codes,
                 })
             except (IndexError, AttributeError):
@@ -837,8 +1056,80 @@ def news():
             pass
     return jsonify(results)
 
-@app.route('/api/recommend')
-def recommend():
+# ── Fundamental data fetchers ──────────────────────────────────────────
+def _fetch_pe_pb_yield():
+    """Fetch PE ratio, PB ratio, dividend yield for all TSE + OTC stocks"""
+    result = {}
+    # TSE stocks
+    try:
+        data = cached_get('https://www.twse.com.tw/rwd/zh/afterTrading/BWIBBU_ALL?response=json', ttl=3600)
+        for row in data.get('data', []):
+            try:
+                code = row[0].strip()
+                pe = float(row[2]) if row[2] and row[2] != '-' else None
+                dy = float(row[3]) if row[3] and row[3] != '-' else None
+                pb = float(row[4]) if row[4] and row[4] != '-' else None
+                result[code] = {'pe': pe, 'yield': dy, 'pb': pb}
+            except (ValueError, IndexError):
+                continue
+    except Exception:
+        pass
+    # OTC stocks
+    try:
+        data = cached_get('https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis', ttl=3600)
+        for row in data:
+            try:
+                code = row.get('SecuritiesCompanyCode', '').strip()
+                pe = float(row['PriceEarningRatio']) if row.get('PriceEarningRatio') and row['PriceEarningRatio'] != '-' else None
+                dy = float(row['YieldRatio']) if row.get('YieldRatio') and row['YieldRatio'] != '-' else None
+                pb = float(row['PriceBookRatio']) if row.get('PriceBookRatio') and row['PriceBookRatio'] != '-' else None
+                if code:
+                    result[code] = {'pe': pe, 'yield': dy, 'pb': pb}
+            except (ValueError, KeyError):
+                continue
+    except Exception:
+        pass
+    return result
+
+def _fetch_revenue_growth():
+    """Fetch monthly revenue MoM and YoY growth for all TSE + OTC stocks"""
+    result = {}
+    # TSE stocks
+    try:
+        data = cached_get('https://openapi.twse.com.tw/v1/opendata/t187ap05_L', ttl=3600)
+        for row in data:
+            try:
+                code = row.get('公司代號', '').strip()
+                yoy = float(row['營業收入-去年同月增減(%)']) if row.get('營業收入-去年同月增減(%)') and row['營業收入-去年同月增減(%)'] != '-' else None
+                mom = float(row['營業收入-上月比較增減(%)']) if row.get('營業收入-上月比較增減(%)') and row['營業收入-上月比較增減(%)'] != '-' else None
+                rev = int(row['營業收入-當月營收']) if row.get('營業收入-當月營收') else 0
+                period = row.get('資料年月', '')
+                if code:
+                    result[code] = {'yoy': yoy, 'mom': mom, 'revenue': rev, 'period': period}
+            except (ValueError, KeyError):
+                continue
+    except Exception:
+        pass
+    # OTC stocks
+    try:
+        data = cached_get('https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O', ttl=3600)
+        for row in data:
+            try:
+                code = row.get('公司代號', '').strip()
+                yoy = float(row['營業收入-去年同月增減(%)']) if row.get('營業收入-去年同月增減(%)') and row['營業收入-去年同月增減(%)'] != '-' else None
+                mom = float(row['營業收入-上月比較增減(%)']) if row.get('營業收入-上月比較增減(%)') and row['營業收入-上月比較增減(%)'] != '-' else None
+                rev = int(row['營業收入-當月營收']) if row.get('營業收入-當月營收') else 0
+                period = row.get('資料年月', '')
+                if code:
+                    result[code] = {'yoy': yoy, 'mom': mom, 'revenue': rev, 'period': period}
+            except (ValueError, KeyError):
+                continue
+    except Exception:
+        pass
+    return result
+
+def _fetch_institutional():
+    """Fetch institutional net buy/sell data (三大法人買賣超)"""
     inst_map = {}
     today = datetime.date.today()
     for days_back in range(7):
@@ -853,16 +1144,200 @@ def recommend():
                 for row in data['data']:
                     try:
                         code = row[0].strip()
+                        name = row[1].strip()
                         inst_map[code] = {
-                            'foreign': int(row[4].replace(',', '')),
-                            'trust': int(row[7].replace(',', '')),
-                            'total': int(row[11].replace(',', '')),
+                            'name': name,
+                            'foreign': int(row[4].replace(',', '')),   # 外陸資買賣超
+                            'trust': int(row[10].replace(',', '')),    # 投信買賣超
+                            'total': int(row[18].replace(',', '')),    # 三大法人買賣超
                         }
                     except (ValueError, IndexError):
                         continue
                 break
         except Exception:
             continue
+    return inst_map
+
+@app.route('/api/recommend')
+def recommend():
+    # 1. Fetch all fundamental data in parallel-ish (cached after first call)
+    fund_map = _fetch_pe_pb_yield()       # PE, PB, dividend yield
+    rev_map = _fetch_revenue_growth()      # revenue MoM/YoY growth
+    inst_map = _fetch_institutional()      # institutional buying
+
+    # 2. Fetch real-time prices for popular stocks
+    all_tse = list(dict.fromkeys(POPULAR_TSE))
+    all_otc = list(dict.fromkeys(POPULAR_OTC))
+    pairs = [(c, 'tse') for c in all_tse] + [(c, 'otc') for c in all_otc]
+    stocks = fetch_stocks(pairs)
+
+    seen = set()
+    unique = []
+    for s in stocks:
+        if s['code'] not in seen and s['price'] > 0:
+            seen.add(s['code'])
+            unique.append(s)
+
+    # 3. Score each stock with fundamentals + technicals
+    scored = []
+    for s in unique:
+        code = s['code']
+        score = 0
+        reasons = []
+        fund = fund_map.get(code, {})
+        rev = rev_map.get(code, {})
+        inst = inst_map.get(code)
+
+        pe = fund.get('pe')
+        dy = fund.get('yield')
+        pb = fund.get('pb')
+        yoy = rev.get('yoy')
+        mom = rev.get('mom')
+
+        # ── PE ratio scoring ──
+        if pe is not None and pe > 0:
+            if pe <= 12:
+                score += 4
+                reasons.append(f'本益比極低 {pe:.1f}')
+            elif pe <= 18:
+                score += 3
+                reasons.append(f'本益比偏低 {pe:.1f}')
+            elif pe <= 25:
+                score += 2
+                reasons.append(f'本益比合理 {pe:.1f}')
+            elif pe <= 40:
+                score += 1
+
+        # ── Dividend yield scoring ──
+        if dy is not None:
+            if dy >= 6:
+                score += 4
+                reasons.append(f'高殖利率 {dy:.1f}%')
+            elif dy >= 4:
+                score += 3
+                reasons.append(f'殖利率佳 {dy:.1f}%')
+            elif dy >= 2:
+                score += 2
+                reasons.append(f'殖利率 {dy:.1f}%')
+            elif dy >= 1:
+                score += 1
+
+        # ── PB ratio scoring ──
+        if pb is not None:
+            if pb < 1:
+                score += 3
+                reasons.append(f'股價淨值比 {pb:.2f} (低於淨值)')
+            elif pb < 1.5:
+                score += 2
+                reasons.append(f'淨值比偏低 {pb:.2f}')
+            elif pb < 2.5:
+                score += 1
+
+        # ── Revenue YoY growth scoring ──
+        if yoy is not None:
+            if yoy >= 50:
+                score += 5
+                reasons.append(f'營收年增 {yoy:+.1f}% 🚀')
+            elif yoy >= 30:
+                score += 4
+                reasons.append(f'營收年增 {yoy:+.1f}%')
+            elif yoy >= 15:
+                score += 3
+                reasons.append(f'營收年增 {yoy:+.1f}%')
+            elif yoy >= 5:
+                score += 2
+                reasons.append(f'營收穩定成長 {yoy:+.1f}%')
+            elif yoy > 0:
+                score += 1
+
+        # ── Revenue MoM growth scoring ──
+        if mom is not None:
+            if mom >= 20:
+                score += 3
+                reasons.append(f'月營收大增 {mom:+.1f}%')
+            elif mom >= 10:
+                score += 2
+                reasons.append(f'月營收成長 {mom:+.1f}%')
+            elif mom > 0:
+                score += 1
+
+        # ── Institutional buying scoring ──
+        if inst and inst['total'] > 0:
+            lots = inst['total'] // 1000
+            if lots > 1000:
+                score += 4
+                reasons.append(f'法人狂買 {lots:,}張')
+            elif lots > 500:
+                score += 3
+                reasons.append(f'法人大買 {lots:,}張')
+            elif lots > 100:
+                score += 2
+                reasons.append(f'法人買超 {lots:,}張')
+            elif lots > 0:
+                score += 1
+            if inst.get('foreign', 0) > 0 and inst.get('trust', 0) > 0:
+                score += 2
+                reasons.append('外資投信聯手')
+
+        # ── Price momentum (small bonus) ──
+        if s['change_pct'] > 3:
+            score += 2
+            reasons.append(f'今日強漲 +{s["change_pct"]}%')
+        elif s['change_pct'] > 1:
+            score += 1
+
+        # Must have at least some fundamental data and a minimum score
+        has_fundamental = (pe is not None) or (dy is not None) or (yoy is not None)
+        if score >= 6 and reasons and has_fundamental:
+            # Determine category based on strongest dimension
+            has_rev_growth = yoy is not None and yoy > 20
+            has_high_yield = (dy or 0) >= 5
+            inst_score = (inst['total'] if inst else 0) // 1000
+            has_value = pe is not None and pe <= 15 and (dy or 0) >= 3
+
+            if has_rev_growth and has_high_yield:
+                cat = '基本面優質'
+                cat_icon = '🏆'
+            elif has_rev_growth:
+                cat = '營收成長股'
+                cat_icon = '📊'
+            elif has_high_yield:
+                cat = '高殖利率'
+                cat_icon = '💰'
+            elif inst_score > 500:
+                cat = '法人加持'
+                cat_icon = '🔥'
+            elif has_value:
+                cat = '低估值精選'
+                cat_icon = '🏆'
+            else:
+                cat = '綜合推薦'
+                cat_icon = '⭐'
+
+            scored.append({
+                'code': code, 'name': s['name'],
+                'price': s['price'], 'change': s['change'],
+                'change_pct': s['change_pct'], 'volume': s['volume'],
+                'market': s['market'], 'score': score,
+                'category': cat, 'cat_icon': cat_icon,
+                'reasons': reasons,
+                # Fundamental data for frontend display
+                'pe': round(pe, 1) if pe else None,
+                'pb': round(pb, 2) if pb else None,
+                'dividend_yield': round(dy, 2) if dy else None,
+                'rev_yoy': round(yoy, 1) if yoy else None,
+                'rev_mom': round(mom, 1) if mom else None,
+            })
+
+    scored.sort(key=lambda x: x['score'], reverse=True)
+    return jsonify(scored[:12])
+
+@app.route('/api/recommend_sell')
+def recommend_sell():
+    """Recommend stocks to SELL based on fundamental deterioration"""
+    fund_map = _fetch_pe_pb_yield()
+    rev_map = _fetch_revenue_growth()
+    inst_map = _fetch_institutional()
 
     all_tse = list(dict.fromkeys(POPULAR_TSE))
     all_otc = list(dict.fromkeys(POPULAR_OTC))
@@ -878,67 +1353,2053 @@ def recommend():
 
     scored = []
     for s in unique:
+        code = s['code']
         score = 0
         reasons = []
-        code = s['code']
+        fund = fund_map.get(code, {})
+        rev = rev_map.get(code, {})
         inst = inst_map.get(code)
 
-        if inst and inst['total'] > 0:
-            lots = inst['total'] // 1000
-            if lots > 1000:
-                score += 5
-                reasons.append(f'法人狂買 {lots:,}張')
-            elif lots > 500:
+        pe = fund.get('pe')
+        dy = fund.get('yield')
+        pb = fund.get('pb')
+        yoy = rev.get('yoy')
+        mom = rev.get('mom')
+
+        # ── PE ratio: overvalued ──
+        if pe is not None:
+            if pe < 0:
                 score += 4
-                reasons.append(f'法人大買 {lots:,}張')
-            elif lots > 100:
+                reasons.append(f'本益比為負 {pe:.1f} (虧損)')
+            elif pe > 100:
+                score += 4
+                reasons.append(f'本益比極高 {pe:.1f}')
+            elif pe > 60:
                 score += 3
-                reasons.append(f'法人買超 {lots:,}張')
+                reasons.append(f'本益比偏高 {pe:.1f}')
+            elif pe > 40:
+                score += 2
+                reasons.append(f'本益比偏貴 {pe:.1f}')
+
+        # ── PB ratio: overpriced ──
+        if pb is not None:
+            if pb > 8:
+                score += 3
+                reasons.append(f'淨值比極高 {pb:.2f}')
+            elif pb > 5:
+                score += 2
+                reasons.append(f'淨值比偏高 {pb:.2f}')
+
+        # ── No dividend ──
+        if dy is not None and dy == 0 and pe is not None and pe > 30:
+            score += 2
+            reasons.append('零殖利率 + 高本益比')
+
+        # ── Revenue YoY decline ──
+        if yoy is not None:
+            if yoy <= -30:
+                score += 5
+                reasons.append(f'營收年減 {yoy:.1f}% 📉')
+            elif yoy <= -15:
+                score += 4
+                reasons.append(f'營收年減 {yoy:.1f}%')
+            elif yoy <= -5:
+                score += 3
+                reasons.append(f'營收衰退 {yoy:.1f}%')
+            elif yoy < 0:
+                score += 1
+
+        # ── Revenue MoM decline ──
+        if mom is not None:
+            if mom <= -30:
+                score += 3
+                reasons.append(f'月營收驟降 {mom:.1f}%')
+            elif mom <= -15:
+                score += 2
+                reasons.append(f'月營收下滑 {mom:.1f}%')
+            elif mom <= -5:
+                score += 1
+
+        # ── Institutional selling ──
+        if inst and inst['total'] < 0:
+            lots = abs(inst['total']) // 1000
+            if lots > 1000:
+                score += 4
+                reasons.append(f'法人狂賣 {lots:,}張')
+            elif lots > 500:
+                score += 3
+                reasons.append(f'法人大賣 {lots:,}張')
+            elif lots > 100:
+                score += 2
+                reasons.append(f'法人賣超 {lots:,}張')
             elif lots > 0:
                 score += 1
-            if inst.get('foreign', 0) > 0 and inst.get('trust', 0) > 0:
+            if inst.get('foreign', 0) < 0 and inst.get('trust', 0) < 0:
                 score += 2
-                reasons.append('外資投信聯手')
+                reasons.append('外資投信同步賣出')
 
-        if s['change_pct'] > 5:
-            score += 4
-            reasons.append(f'漲停板 +{s["change_pct"]}%')
-        elif s['change_pct'] > 3:
+        # ── Price dropping ──
+        if s['change_pct'] < -5:
             score += 3
-            reasons.append(f'大幅上漲 +{s["change_pct"]}%')
-        elif s['change_pct'] > 1:
+            reasons.append(f'今日重挫 {s["change_pct"]}%')
+        elif s['change_pct'] < -2:
             score += 2
-            reasons.append(f'穩健上漲 +{s["change_pct"]}%')
-        elif s['change_pct'] > 0:
+            reasons.append(f'今日下跌 {s["change_pct"]}%')
+        elif s['change_pct'] < 0:
             score += 1
 
-        vol = int(s['volume']) if s['volume'] != '-' else 0
-        if vol > 50000:
-            score += 3
-            reasons.append('爆量交易')
-        elif vol > 20000:
-            score += 2
-            reasons.append('量能放大')
-        elif vol > 5000:
-            score += 1
+        has_fundamental = (pe is not None) or (yoy is not None)
+        if score >= 6 and reasons and has_fundamental:
+            has_rev_decline = yoy is not None and yoy < -10
+            has_inst_sell = inst is not None and inst['total'] < -500000
+            has_high_pe = pe is not None and (pe > 60 or pe < 0)
 
-        if score >= 5 and reasons:
-            if inst and inst['total'] > 500000:
-                cat = '法人加持'
-            elif s['change_pct'] > 2:
-                cat = '強勢突破'
+            if has_rev_decline and has_high_pe:
+                cat = '基本面惡化'
+                cat_icon = '🚨'
+            elif has_inst_sell:
+                cat = '法人倒貨'
+                cat_icon = '📉'
+            elif has_rev_decline:
+                cat = '營收衰退'
+                cat_icon = '⚠️'
+            elif has_high_pe:
+                cat = '高估值風險'
+                cat_icon = '💸'
             else:
-                cat = '值得關注'
+                cat = '綜合警示'
+                cat_icon = '🔻'
+
             scored.append({
                 'code': code, 'name': s['name'],
                 'price': s['price'], 'change': s['change'],
                 'change_pct': s['change_pct'], 'volume': s['volume'],
                 'market': s['market'], 'score': score,
-                'category': cat, 'reasons': reasons,
+                'category': cat, 'cat_icon': cat_icon,
+                'reasons': reasons,
+                'pe': round(pe, 1) if pe else None,
+                'pb': round(pb, 2) if pb else None,
+                'dividend_yield': round(dy, 2) if dy else None,
+                'rev_yoy': round(yoy, 1) if yoy else None,
+                'rev_mom': round(mom, 1) if mom else None,
             })
 
     scored.sort(key=lambda x: x['score'], reverse=True)
-    return jsonify(scored[:10])
+    return jsonify(scored[:12])
+
+@app.route('/api/hot_stocks')
+def hot_stocks():
+    """Return institutional buying rankings + volume leaders"""
+    inst_map = _fetch_institutional()
+
+    # Filter out ETFs (codes starting with 00) for individual stock rankings
+    etf_prefixes = ('00',)
+    stocks_only = {k: v for k, v in inst_map.items() if not k.startswith(etf_prefixes)}
+
+    def _build_ranking(data, sort_key, limit=10):
+        items = sorted(data.items(), key=lambda x: x[1][sort_key], reverse=True)[:limit]
+        result = []
+        for code, info in items:
+            name = STOCK_NAMES.get(code) or info.get('name', code)
+            lots = info[sort_key] // 1000
+            if lots <= 0:
+                continue
+            result.append({
+                'code': code, 'name': name,
+                'lots': lots,
+                'foreign_lots': info['foreign'] // 1000,
+                'trust_lots': info['trust'] // 1000,
+                'total_lots': info['total'] // 1000,
+            })
+        return result
+
+    # Rankings for individual stocks (exclude ETFs)
+    foreign_rank = _build_ranking(stocks_only, 'foreign', 10)
+    trust_rank = _build_ranking(stocks_only, 'trust', 10)
+    total_rank = _build_ranking(stocks_only, 'total', 10)
+
+    # Volume leaders from TWSE
+    volume_rank = []
+    try:
+        data = cached_get('https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX20?response=json&type=ALLBUT0999', ttl=1800)
+        if data.get('stat') == 'OK':
+            for row in data.get('data', [])[:20]:
+                try:
+                    code = row[1].strip()
+                    name = STOCK_NAMES.get(code) or row[2].strip()
+                    vol_shares = int(row[3].replace(',', ''))
+                    close_str = row[8].replace(',', '')
+                    close = float(close_str) if close_str and close_str != '--' else 0
+                    # Parse change direction from HTML span (red=up, green=down)
+                    sign_html = str(row[9])
+                    chg_val_str = row[10].replace(',', '')
+                    chg_val = float(chg_val_str) if chg_val_str and chg_val_str != '0.00' else 0
+                    if 'green' in sign_html:
+                        chg_val = -abs(chg_val)
+                    chg_pct = round(chg_val / (close - chg_val) * 100, 2) if close and (close - chg_val) != 0 else 0
+                    volume_rank.append({
+                        'code': code, 'name': name,
+                        'volume': vol_shares // 1000,  # in lots (張)
+                        'close': close, 'change': round(chg_val, 2),
+                        'change_pct': chg_pct,
+                    })
+                except (ValueError, IndexError):
+                    continue
+    except Exception:
+        pass
+
+    return jsonify({
+        'foreign': foreign_rank,
+        'trust': trust_rank,
+        'total': total_rank,
+        'volume': volume_rank,
+    })
+
+@app.route('/api/watchlist_health')
+def watchlist_health():
+    """Analyze all stocks in the user's watchlist"""
+    wl = load_watchlist()
+    if not wl:
+        return jsonify([])
+    fund_map = _fetch_pe_pb_yield()
+    rev_map = _fetch_revenue_growth()
+    inst_map = _fetch_institutional()
+
+    # Fetch real-time prices
+    pairs = [(w['code'], w.get('market', 'tse')) for w in wl]
+    stocks = fetch_stocks(pairs)
+    smap = {s['code']: s for s in stocks}
+
+    results = []
+    for w in wl:
+        code = w['code']
+        s = smap.get(code)
+        if not s:
+            continue
+        fund = fund_map.get(code, {})
+        rev = rev_map.get(code, {})
+        inst = inst_map.get(code)
+        pe = fund.get('pe')
+        dy = fund.get('yield')
+        pb = fund.get('pb')
+        yoy = rev.get('yoy')
+        mom = rev.get('mom')
+
+        buy_score, sell_score = 0, 0
+        alerts = []
+
+        if pe is not None:
+            if pe < 0:
+                sell_score += 4; alerts.append('⚠️ 虧損中')
+            elif pe <= 15:
+                buy_score += 3
+            elif pe > 60:
+                sell_score += 3; alerts.append(f'⚠️ PE={pe:.0f} 過高')
+            elif pe > 40:
+                sell_score += 2
+        if dy is not None:
+            if dy >= 5: buy_score += 3
+            elif dy >= 3: buy_score += 2
+        if pb is not None:
+            if pb < 1: buy_score += 2
+            elif pb > 8: sell_score += 2; alerts.append(f'⚠️ PB={pb:.1f} 過高')
+        if yoy is not None:
+            if yoy >= 20: buy_score += 3
+            elif yoy >= 5: buy_score += 1
+            elif yoy <= -20:
+                sell_score += 4; alerts.append(f'📉 營收年減{yoy:.0f}%')
+            elif yoy < 0:
+                sell_score += 2; alerts.append(f'📉 營收衰退{yoy:.0f}%')
+        if mom is not None:
+            if mom >= 15: buy_score += 1
+            elif mom <= -20: sell_score += 1
+        if inst:
+            total_lots = inst['total'] // 1000
+            if total_lots > 500: buy_score += 2
+            elif total_lots < -500:
+                sell_score += 2; alerts.append(f'📉 法人賣超{abs(total_lots):,}張')
+
+        diff = buy_score - sell_score
+        if diff >= 4:
+            action, icon, color = '加碼', '🟢', 'green'
+        elif diff >= 1:
+            action, icon, color = '持有', '🟡', 'gold'
+        elif diff >= -2:
+            action, icon, color = '觀望', '🟠', 'orange'
+        else:
+            action, icon, color = '減碼', '🔴', 'red'
+
+        results.append({
+            'code': code, 'name': s['name'],
+            'price': s['price'], 'change': s['change'],
+            'change_pct': s['change_pct'],
+            'action': action, 'icon': icon, 'color': color,
+            'buy_score': buy_score, 'sell_score': sell_score,
+            'pe': round(pe, 1) if pe else None,
+            'dividend_yield': round(dy, 2) if dy else None,
+            'rev_yoy': round(yoy, 1) if yoy else None,
+            'alerts': alerts,
+        })
+    return jsonify(results)
+
+@app.route('/api/margin')
+def margin_trading():
+    """Fetch margin trading (融資融券) data for individual stocks"""
+    today = datetime.date.today()
+    result = {'date': '', 'summary': {}, 'stocks': []}
+    for days_back in range(7):
+        d = today - datetime.timedelta(days=days_back)
+        if d.weekday() >= 5:
+            continue
+        date_str = d.strftime('%Y%m%d')
+        try:
+            url = f'https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?response=json&date={date_str}&selectType=ALL'
+            data = cached_get(url, ttl=3600)
+            if data.get('stat') != 'OK':
+                continue
+            tables = data.get('tables', [])
+            if len(tables) < 2:
+                continue
+            # Summary table
+            summary = tables[0]
+            for row in summary.get('data', []):
+                if '融資' in row[0] and '金額' not in row[0]:
+                    result['summary']['margin_buy'] = row[1]
+                    result['summary']['margin_sell'] = row[2]
+                    result['summary']['margin_balance'] = row[4]
+                    result['summary']['margin_today'] = row[5] if len(row) > 5 else row[4]
+                elif '融券' in row[0] and '金額' not in row[0]:
+                    result['summary']['short_buy'] = row[1]
+                    result['summary']['short_sell'] = row[2]
+                    result['summary']['short_balance'] = row[4]
+                    result['summary']['short_today'] = row[5] if len(row) > 5 else row[4]
+            # Individual stocks — pick top movers
+            detail = tables[1]
+            all_stocks = []
+            for row in detail.get('data', []):
+                try:
+                    code = row[0].strip()
+                    if code.startswith('00'):
+                        continue  # skip ETFs
+                    name = STOCK_NAMES.get(code) or row[1].strip()
+                    m_prev = int(row[5].replace(',', ''))
+                    m_today = int(row[6].replace(',', ''))
+                    m_chg = m_today - m_prev
+                    s_prev = int(row[11].replace(',', ''))
+                    s_today = int(row[12].replace(',', ''))
+                    s_chg = s_today - s_prev
+                    all_stocks.append({
+                        'code': code, 'name': name,
+                        'margin_balance': m_today, 'margin_change': m_chg,
+                        'short_balance': s_today, 'short_change': s_chg,
+                    })
+                except (ValueError, IndexError):
+                    continue
+            # Sort: top margin increase + top margin decrease
+            inc = sorted(all_stocks, key=lambda x: x['margin_change'], reverse=True)[:10]
+            dec = sorted(all_stocks, key=lambda x: x['margin_change'])[:10]
+            result['stocks_increase'] = inc
+            result['stocks_decrease'] = dec
+            roc_year = d.year - 1911
+            result['date'] = f'{roc_year}/{d.month:02d}/{d.day:02d}'
+            break
+        except Exception:
+            continue
+    return jsonify(result)
+
+@app.route('/api/dca_calc')
+def dca_calc():
+    """Dollar Cost Averaging (定期定額) calculator using historical data"""
+    code = request.args.get('code', '').strip()
+    monthly = request.args.get('amount', '3000')
+    months_str = request.args.get('months', '12')
+    if not code:
+        return jsonify({'error': 'need code'}), 400
+    try:
+        monthly_amount = int(monthly)
+        total_months = int(months_str)
+    except ValueError:
+        return jsonify({'error': 'invalid amount'}), 400
+    total_months = min(total_months, 36)  # cap at 3 years
+
+    # Determine market
+    market = 'tse'
+    if code in [c for c in POPULAR_OTC]:
+        market = 'otc'
+
+    # Fetch enough historical data
+    all_data = []
+    today = datetime.date.today()
+    for m in range(total_months + 2):
+        d = today.replace(day=1) - datetime.timedelta(days=m * 28)
+        if market == 'tse':
+            date_str = d.strftime('%Y%m01')
+            url = f'https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&date={date_str}&stockNo={code}'
+        else:
+            roc_year = d.year - 1911
+            roc_date = f'{roc_year}/{d.month:02d}'
+            url = f'https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={roc_date}&stkno={code}'
+        try:
+            data = cached_get(url, ttl=86400)
+            rows = data.get('data', []) if market == 'tse' else data.get('aaData', [])
+            for row in rows:
+                try:
+                    if market == 'tse':
+                        parts = row[0].split('/')
+                        y = int(parts[0]) + 1911
+                        date_key = f'{y}-{parts[1]}-{parts[2]}'
+                        close = float(str(row[6]).replace(',', ''))
+                    else:
+                        parts = row[0].split('/')
+                        y = int(parts[0]) + 1911
+                        date_key = f'{y}-{parts[1].zfill(2)}-{parts[2].zfill(2)}'
+                        close = float(str(row[6]).replace(',', ''))
+                    all_data.append({'date': date_key, 'close': close})
+                except (ValueError, IndexError):
+                    continue
+        except Exception:
+            continue
+
+    if not all_data:
+        return jsonify({'error': 'no data', 'records': []})
+
+    all_data.sort(key=lambda x: x['date'])
+
+    # Group by month, take first trading day of each month
+    monthly_prices = {}
+    for d in all_data:
+        month_key = d['date'][:7]  # YYYY-MM
+        if month_key not in monthly_prices:
+            monthly_prices[month_key] = d['close']
+
+    months_list = sorted(monthly_prices.keys())
+    if len(months_list) < 2:
+        return jsonify({'error': 'not enough data', 'records': []})
+
+    # Take only the last N months
+    target_months = months_list[-total_months:] if len(months_list) >= total_months else months_list
+
+    records = []
+    total_invested = 0
+    total_shares = 0
+    for mo in target_months:
+        price = monthly_prices[mo]
+        shares = monthly_amount / price
+        total_invested += monthly_amount
+        total_shares += shares
+        current_value = total_shares * price
+        records.append({
+            'month': mo,
+            'price': round(price, 2),
+            'shares': round(shares, 4),
+            'total_shares': round(total_shares, 4),
+            'total_invested': total_invested,
+            'value': round(current_value, 0),
+        })
+
+    # Current price
+    current_price = all_data[-1]['close'] if all_data else monthly_prices.get(target_months[-1], 0)
+    current_value = round(total_shares * current_price, 0)
+    profit = current_value - total_invested
+    profit_pct = round(profit / total_invested * 100, 2) if total_invested > 0 else 0
+    avg_cost = round(total_invested / total_shares, 2) if total_shares > 0 else 0
+    name = STOCK_NAMES.get(code, code)
+
+    return jsonify({
+        'code': code, 'name': name,
+        'months': len(target_months),
+        'monthly_amount': monthly_amount,
+        'total_invested': total_invested,
+        'total_shares': round(total_shares, 4),
+        'avg_cost': avg_cost,
+        'current_price': current_price,
+        'current_value': current_value,
+        'profit': round(profit, 0),
+        'profit_pct': profit_pct,
+        'records': records,
+    })
+
+@app.route('/api/chip_analysis')
+def chip_analysis():
+    """Analyze chip distribution (籌碼面) for a given stock"""
+    code = request.args.get('code', '').strip()
+    if not code:
+        return jsonify({'error': 'need code'}), 400
+
+    inst_map = _fetch_institutional()
+    inst = inst_map.get(code)
+
+    # Get multi-day institutional data for trend
+    today = datetime.date.today()
+    daily_data = []
+    for days_back in range(10):
+        d = today - datetime.timedelta(days=days_back)
+        if d.weekday() >= 5:
+            continue
+        date_str = d.strftime('%Y%m%d')
+        try:
+            url = f'https://www.twse.com.tw/fund/T86?response=json&date={date_str}&selectType=ALLBUT0999'
+            data = cached_get(url, ttl=3600)
+            if data.get('stat') == 'OK' and data.get('data'):
+                for row in data['data']:
+                    try:
+                        if row[0].strip() == code:
+                            daily_data.append({
+                                'date': d.strftime('%m/%d'),
+                                'foreign': int(row[4].replace(',', '')) // 1000,
+                                'trust': int(row[10].replace(',', '')) // 1000,
+                                'total': int(row[18].replace(',', '')) // 1000,
+                            })
+                            break
+                    except (ValueError, IndexError):
+                        continue
+        except Exception:
+            continue
+
+    daily_data.reverse()  # oldest first
+
+    # Margin data for the stock
+    margin_info = {}
+    for days_back in range(7):
+        d = today - datetime.timedelta(days=days_back)
+        if d.weekday() >= 5:
+            continue
+        date_str = d.strftime('%Y%m%d')
+        try:
+            url = f'https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?response=json&date={date_str}&selectType=ALL'
+            data = cached_get(url, ttl=3600)
+            if data.get('stat') != 'OK':
+                continue
+            tables = data.get('tables', [])
+            if len(tables) < 2:
+                continue
+            detail = tables[1]
+            for row in detail.get('data', []):
+                try:
+                    if row[0].strip() == code:
+                        margin_info = {
+                            'margin_balance': int(row[6].replace(',', '')),
+                            'margin_change': int(row[6].replace(',', '')) - int(row[5].replace(',', '')),
+                            'short_balance': int(row[12].replace(',', '')),
+                            'short_change': int(row[12].replace(',', '')) - int(row[11].replace(',', '')),
+                        }
+                        break
+                except (ValueError, IndexError):
+                    continue
+            if margin_info:
+                break
+        except Exception:
+            continue
+
+    # Calculate trend
+    total_foreign = sum(d['foreign'] for d in daily_data)
+    total_trust = sum(d['trust'] for d in daily_data)
+    total_net = sum(d['total'] for d in daily_data)
+    consecutive_buy = 0
+    consecutive_sell = 0
+    for d in reversed(daily_data):
+        if d['total'] > 0:
+            consecutive_buy += 1
+        else:
+            break
+    for d in reversed(daily_data):
+        if d['total'] < 0:
+            consecutive_sell += 1
+        else:
+            break
+
+    # Generate insight
+    insights = []
+    if consecutive_buy >= 3:
+        insights.append(f'🔥 法人連續{consecutive_buy}日買超，籌碼持續集中')
+    elif consecutive_sell >= 3:
+        insights.append(f'⚠️ 法人連續{consecutive_sell}日賣超，籌碼鬆動中')
+
+    if total_foreign > 0 and total_trust > 0:
+        insights.append('✅ 近期外資投信同步買進，主力認同度高')
+    elif total_foreign < 0 and total_trust < 0:
+        insights.append('🚨 外資投信同步賣出，注意風險')
+    elif total_foreign > 0 and total_trust < 0:
+        insights.append('📊 外資買、投信賣，法人意見分歧')
+    elif total_foreign < 0 and total_trust > 0:
+        insights.append('📊 投信買、外資賣，短線可能有支撐')
+
+    if margin_info:
+        mc = margin_info.get('margin_change', 0)
+        if mc > 500:
+            insights.append(f'📈 融資大增{mc:,}張，散戶追買意願強')
+        elif mc < -500:
+            insights.append(f'📉 融資減少{abs(mc):,}張，散戶停損或換股')
+
+    # Chip concentration score
+    chip_score = 0
+    if total_net > 0:
+        chip_score += min(total_net // 500, 5)
+    else:
+        chip_score -= min(abs(total_net) // 500, 5)
+    if consecutive_buy >= 3:
+        chip_score += 2
+    elif consecutive_sell >= 3:
+        chip_score -= 2
+
+    if chip_score >= 4:
+        status = '籌碼集中'
+        status_icon = '🟢'
+        status_color = 'green'
+    elif chip_score >= 1:
+        status = '偏多'
+        status_icon = '🟡'
+        status_color = 'gold'
+    elif chip_score >= -1:
+        status = '中性'
+        status_icon = '⚪'
+        status_color = 'gray'
+    elif chip_score >= -4:
+        status = '偏空'
+        status_icon = '🟠'
+        status_color = 'orange'
+    else:
+        status = '籌碼鬆散'
+        status_icon = '🔴'
+        status_color = 'red'
+
+    name = STOCK_NAMES.get(code, code)
+    return jsonify({
+        'code': code,
+        'name': name,
+        'status': status,
+        'status_icon': status_icon,
+        'status_color': status_color,
+        'chip_score': chip_score,
+        'daily': daily_data,
+        'total_foreign': total_foreign,
+        'total_trust': total_trust,
+        'total_net': total_net,
+        'consecutive_buy': consecutive_buy,
+        'consecutive_sell': consecutive_sell,
+        'margin': margin_info,
+        'insights': insights,
+    })
+
+@app.route('/api/backtest')
+def backtest():
+    """Compare historical performance of multiple stocks"""
+    codes_str = request.args.get('codes', '').strip()
+    months = int(request.args.get('months', '3'))
+    if not codes_str:
+        return jsonify({'error': 'need codes'}), 400
+    codes = [c.strip() for c in codes_str.split(',') if c.strip()][:5]  # max 5 stocks
+    months = min(months, 12)
+
+    results = []
+    for code in codes:
+        market = 'otc' if code in POPULAR_OTC else 'tse'
+        all_data = []
+        today = datetime.date.today()
+        for m in range(months + 1):
+            d = today.replace(day=1) - datetime.timedelta(days=m * 28)
+            try:
+                if market == 'tse':
+                    date_str = d.strftime('%Y%m01')
+                    url = f'https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&date={date_str}&stockNo={code}'
+                    data = cached_get(url, ttl=3600)
+                    for row in data.get('data', []):
+                        parts = row[0].split('/')
+                        y = int(parts[0]) + 1911
+                        try:
+                            all_data.append({
+                                'date': f'{y}-{parts[1]}-{parts[2]}',
+                                'close': float(row[6].replace(',', '')),
+                            })
+                        except (ValueError, IndexError):
+                            continue
+                else:
+                    roc_year = d.year - 1911
+                    roc_date = f'{roc_year}/{d.month:02d}'
+                    url = f'https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={roc_date}&stkno={code}'
+                    data = cached_get(url, ttl=3600)
+                    for row in data.get('aaData', []):
+                        parts = row[0].split('/')
+                        y = int(parts[0]) + 1911
+                        try:
+                            all_data.append({
+                                'date': f'{y}-{parts[1].zfill(2)}-{parts[2].zfill(2)}',
+                                'close': float(str(row[6]).replace(',', '')),
+                            })
+                        except (ValueError, IndexError):
+                            continue
+            except Exception:
+                continue
+
+        # Yahoo Finance fallback
+        if not all_data:
+            for suffix in ['.TW', '.TWO']:
+                try:
+                    period = f'{months}mo' if months <= 6 else '1y'
+                    url = f'https://query1.finance.yahoo.com/v8/finance/chart/{code}{suffix}?interval=1d&range={period}'
+                    d = cached_get(url, ttl=3600)
+                    chart_result = d.get('chart', {}).get('result')
+                    if not chart_result:
+                        continue
+                    result = chart_result[0]
+                    timestamps = result.get('timestamp', [])
+                    quotes = result.get('indicators', {}).get('quote', [{}])[0]
+                    for i, ts in enumerate(timestamps):
+                        try:
+                            dt = datetime.datetime.fromtimestamp(ts)
+                            c = quotes.get('close', [])[i]
+                            if c:
+                                all_data.append({'date': dt.strftime('%Y-%m-%d'), 'close': round(float(c), 2)})
+                        except (IndexError, TypeError):
+                            continue
+                    if all_data:
+                        break
+                except Exception:
+                    continue
+
+        if not all_data:
+            continue
+
+        all_data.sort(key=lambda x: x['date'])
+        # Remove duplicates
+        seen = set()
+        unique = []
+        for d in all_data:
+            if d['date'] not in seen:
+                seen.add(d['date'])
+                unique.append(d)
+        all_data = unique
+
+        if len(all_data) < 2:
+            continue
+
+        start_price = all_data[0]['close']
+        end_price = all_data[-1]['close']
+        max_price = max(d['close'] for d in all_data)
+        min_price = min(d['close'] for d in all_data)
+        total_return = round((end_price - start_price) / start_price * 100, 2)
+        max_drawdown = round((min_price - max_price) / max_price * 100, 2) if max_price else 0
+
+        # Weekly data points for chart
+        chart_data = []
+        base = all_data[0]['close']
+        for d in all_data:
+            pct = round((d['close'] - base) / base * 100, 2)
+            chart_data.append({'date': d['date'], 'pct': pct, 'close': d['close']})
+
+        name = STOCK_NAMES.get(code, code)
+        results.append({
+            'code': code, 'name': name,
+            'start_price': start_price, 'end_price': end_price,
+            'max_price': max_price, 'min_price': min_price,
+            'total_return': total_return, 'max_drawdown': max_drawdown,
+            'chart': chart_data,
+            'data_points': len(all_data),
+        })
+
+    # Sort by return descending
+    results.sort(key=lambda x: x['total_return'], reverse=True)
+    return jsonify(results)
+
+@app.route('/api/daily_summary')
+def daily_summary():
+    """Generate AI-style daily market summary"""
+    import xml.etree.ElementTree as ET
+
+    # 1. Get market index
+    market = {}
+    try:
+        data = cached_get(f'{API_BASE}?ex_ch=tse_t00.tw|otc_o00.tw', ttl=60)
+        for item in data.get('msgArray', []):
+            s = parse_stock(item)
+            if s and item.get('c') == 't00':
+                market['tse'] = s
+            elif s and item.get('c') == 'o00':
+                market['otc'] = s
+    except Exception:
+        pass
+
+    # Yahoo fallback
+    if 'tse' not in market:
+        try:
+            url = f'https://query1.finance.yahoo.com/v8/finance/chart/%5ETWII?interval=1d&range=5d'
+            d = cached_get(url, ttl=60)
+            meta = d.get('chart', {}).get('result', [{}])[0].get('meta', {})
+            price = float(meta.get('regularMarketPrice', 0))
+            prev = float(meta.get('chartPreviousClose', 0) or meta.get('previousClose', 0))
+            if price and prev:
+                chg = round(price - prev, 2)
+                pct = round(chg / prev * 100, 2)
+                market['tse'] = {'price': price, 'change': chg, 'change_pct': pct}
+        except Exception:
+            pass
+
+    # 2. Institutional summary
+    inst_map = _fetch_institutional()
+    total_foreign = sum(v['foreign'] for v in inst_map.values())
+    total_trust = sum(v['trust'] for v in inst_map.values())
+    total_all = sum(v['total'] for v in inst_map.values())
+
+    # Top 3 foreign buy
+    foreign_top = sorted(inst_map.items(), key=lambda x: x[1]['foreign'], reverse=True)[:3]
+    trust_top = sorted(inst_map.items(), key=lambda x: x[1]['trust'], reverse=True)[:3]
+
+    # 3. Margin data
+    margin_summary = {}
+    today = datetime.date.today()
+    for days_back in range(7):
+        d = today - datetime.timedelta(days=days_back)
+        if d.weekday() >= 5:
+            continue
+        date_str = d.strftime('%Y%m%d')
+        try:
+            url = f'https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?response=json&date={date_str}&selectType=ALL'
+            data = cached_get(url, ttl=3600)
+            if data.get('stat') != 'OK':
+                continue
+            tables = data.get('tables', [])
+            if tables:
+                for row in tables[0].get('data', []):
+                    if '融資' in row[0] and '金額' not in row[0]:
+                        try:
+                            margin_summary['margin_change'] = int(row[5].replace(',', '')) - int(row[4].replace(',', ''))
+                        except (ValueError, IndexError):
+                            margin_summary['margin_change'] = 0
+                    elif '融券' in row[0] and '金額' not in row[0]:
+                        try:
+                            margin_summary['short_change'] = int(row[5].replace(',', '')) - int(row[4].replace(',', ''))
+                        except (ValueError, IndexError):
+                            margin_summary['short_change'] = 0
+            break
+        except Exception:
+            continue
+
+    # 4. Build summary text
+    paragraphs = []
+
+    # Market overview
+    tse = market.get('tse', {})
+    tse_price = tse.get('price', 0)
+    tse_chg = tse.get('change', 0)
+    tse_pct = tse.get('change_pct', 0)
+
+    if tse_pct > 2:
+        mood = '大漲'
+        emoji = '🚀'
+    elif tse_pct > 0.5:
+        mood = '上漲'
+        emoji = '📈'
+    elif tse_pct > -0.5:
+        mood = '平盤整理'
+        emoji = '➡️'
+    elif tse_pct > -2:
+        mood = '下跌'
+        emoji = '📉'
+    else:
+        mood = '重挫'
+        emoji = '💥'
+
+    paragraphs.append({
+        'title': f'{emoji} 大盤{mood}',
+        'text': f'加權指數收 {tse_price:,.0f} 點，{mood} {abs(tse_chg):,.0f} 點（{tse_pct:+.2f}%）。',
+    })
+
+    # Institutional
+    f_lots = total_foreign // 1000
+    t_lots = total_trust // 1000
+    a_lots = total_all // 1000
+
+    if a_lots > 0:
+        inst_text = f'三大法人合計買超 {abs(a_lots):,} 張'
+    else:
+        inst_text = f'三大法人合計賣超 {abs(a_lots):,} 張'
+
+    f_str = f'外資{"買超" if f_lots>0 else "賣超"} {abs(f_lots):,} 張'
+    t_str = f'投信{"買超" if t_lots>0 else "賣超"} {abs(t_lots):,} 張'
+
+    # Top foreign buy names
+    foreign_names = [STOCK_NAMES.get(c, c) for c, _ in foreign_top if _['foreign'] > 0]
+    trust_names = [STOCK_NAMES.get(c, c) for c, _ in trust_top if _['trust'] > 0]
+
+    inst_detail = f'{f_str}，{t_str}。'
+    if foreign_names:
+        inst_detail += f'外資主要買進：{"、".join(foreign_names[:3])}。'
+    if trust_names:
+        inst_detail += f'投信主要加碼：{"、".join(trust_names[:3])}。'
+
+    paragraphs.append({
+        'title': f'🏦 {inst_text}',
+        'text': inst_detail,
+    })
+
+    # Margin
+    mc = margin_summary.get('margin_change', 0)
+    sc = margin_summary.get('short_change', 0)
+    margin_text = ''
+    if mc > 0:
+        margin_text += f'融資增加 {mc:,} 張，散戶追買。'
+    elif mc < 0:
+        margin_text += f'融資減少 {abs(mc):,} 張，散戶趨於謹慎。'
+    if sc > 0:
+        margin_text += f'融券增加 {sc:,} 張，空方力道增強。'
+    elif sc < 0:
+        margin_text += f'融券減少 {abs(sc):,} 張，空方回補。'
+
+    if margin_text:
+        paragraphs.append({
+            'title': '💳 散戶動向',
+            'text': margin_text,
+        })
+
+    # Overall assessment
+    bullish = 0
+    if tse_pct > 0: bullish += 1
+    if tse_pct > 1: bullish += 1
+    if a_lots > 0: bullish += 1
+    if f_lots > 0 and t_lots > 0: bullish += 1
+    if mc and mc < 0 and tse_pct > 0: bullish += 1  # price up + margin down = healthy
+
+    if bullish >= 4:
+        outlook = '偏多看好'
+        outlook_icon = '🟢'
+        outlook_text = '法人持續買超，技術面偏多，短線偏樂觀。但需注意漲多後的回檔壓力。'
+    elif bullish >= 3:
+        outlook = '中性偏多'
+        outlook_icon = '🟡'
+        outlook_text = '盤勢尚稱穩健，法人態度正向，但動能未明顯加速，宜觀察量能變化。'
+    elif bullish >= 2:
+        outlook = '中性觀望'
+        outlook_icon = '⚪'
+        outlook_text = '多空拉鋸中，建議觀望為主，待方向明確再行布局。'
+    elif bullish >= 1:
+        outlook = '中性偏空'
+        outlook_icon = '🟠'
+        outlook_text = '盤勢轉弱，法人態度保守，短線宜減碼或觀望。'
+    else:
+        outlook = '偏空謹慎'
+        outlook_icon = '🔴'
+        outlook_text = '法人持續賣超，盤勢偏弱，建議降低持股比重，保留現金等待機會。'
+
+    paragraphs.append({
+        'title': f'{outlook_icon} 綜合評估：{outlook}',
+        'text': outlook_text,
+    })
+
+    return jsonify({
+        'date': today.strftime('%Y/%m/%d'),
+        'paragraphs': paragraphs,
+        'market': {
+            'tse_price': tse_price,
+            'tse_change': tse_chg,
+            'tse_pct': tse_pct,
+        },
+        'institutional': {
+            'foreign': f_lots,
+            'trust': t_lots,
+            'total': a_lots,
+        },
+        'outlook': outlook,
+        'outlook_icon': outlook_icon,
+    })
+
+@app.route('/api/price_check')
+def price_check():
+    """Check if any price alerts should trigger"""
+    alerts_str = request.args.get('alerts', '')
+    if not alerts_str:
+        return jsonify({'triggered': []})
+
+    try:
+        alerts = json.loads(alerts_str)
+    except json.JSONDecodeError:
+        return jsonify({'triggered': []})
+
+    if not alerts:
+        return jsonify({'triggered': []})
+
+    # Group by market
+    pairs = []
+    for a in alerts:
+        code = a.get('code', '')
+        market = 'otc' if code in POPULAR_OTC else 'tse'
+        pairs.append((code, market))
+
+    stocks = fetch_stocks(pairs)
+    smap = {s['code']: s for s in stocks}
+
+    triggered = []
+    for a in alerts:
+        code = a.get('code', '')
+        s = smap.get(code)
+        if not s:
+            continue
+        target = float(a.get('price', 0))
+        direction = a.get('dir', 'above')
+
+        if direction == 'above' and s['price'] >= target:
+            triggered.append({
+                'code': code, 'name': s['name'],
+                'price': s['price'], 'target': target,
+                'direction': direction,
+                'message': f'{s["name"]}({code}) 已漲到 {s["price"]}，達到目標價 {target}！',
+            })
+        elif direction == 'below' and s['price'] <= target:
+            triggered.append({
+                'code': code, 'name': s['name'],
+                'price': s['price'], 'target': target,
+                'direction': direction,
+                'message': f'{s["name"]}({code}) 已跌到 {s["price"]}，觸及警戒價 {target}！',
+            })
+
+    return jsonify({'triggered': triggered})
+
+# ── Supply chain mapping (產業鏈) ──────────────────────────────────────
+SUPPLY_CHAIN = {
+    # 半導體
+    '2330': {'role': 'IC 製造', 'upstream': [('2454','IC 設計'),('3443','IP 設計'),('6770','IC 製造')], 'downstream': [('3711','封測'),('2303','IC 製造'),('6239','矽智財')]},
+    '2454': {'role': 'IC 設計', 'upstream': [], 'downstream': [('2330','晶圓代工'),('3711','封測')]},
+    '2303': {'role': 'IC 製造', 'upstream': [('2454','IC 設計')], 'downstream': [('3711','封測')]},
+    '3711': {'role': '封裝測試', 'upstream': [('2330','晶圓代工'),('2303','IC 製造')], 'downstream': [('2317','系統組裝')]},
+    '3443': {'role': 'IP 設計', 'upstream': [], 'downstream': [('2330','晶圓代工')]},
+    '6770': {'role': 'IC 製造', 'upstream': [('2454','IC 設計')], 'downstream': [('3711','封測')]},
+    # 電子代工 / PC
+    '2317': {'role': '系統組裝', 'upstream': [('3711','封測'),('2308','電源')], 'downstream': []},
+    '2382': {'role': 'AI 伺服器', 'upstream': [('2330','GPU代工'),('2454','IC設計')], 'downstream': []},
+    '3231': {'role': 'AI 伺服器', 'upstream': [('2330','GPU代工'),('2454','IC設計')], 'downstream': []},
+    '2308': {'role': '電源管理', 'upstream': [], 'downstream': [('2317','系統組裝'),('2382','伺服器')]},
+    # PCB/零組件
+    '3037': {'role': 'PCB/載板', 'upstream': [], 'downstream': [('2330','晶圓代工'),('2454','IC設計')]},
+    '2327': {'role': '被動元件', 'upstream': [], 'downstream': [('2317','系統組裝'),('2382','伺服器')]},
+    # 面板/光電
+    '3008': {'role': '光學鏡頭', 'upstream': [], 'downstream': [('2317','手機組裝')]},
+    # 金融
+    '2882': {'role': '壽險金控', 'upstream': [], 'downstream': []},
+    '2881': {'role': '金控', 'upstream': [], 'downstream': []},
+    '2891': {'role': '金控', 'upstream': [], 'downstream': []},
+    '2886': {'role': '公股金控', 'upstream': [], 'downstream': []},
+    '2892': {'role': '公股金控', 'upstream': [], 'downstream': []},
+    # 傳產
+    '1301': {'role': '石化上游', 'upstream': [], 'downstream': [('1303','塑膠加工'),('1326','石化中游'),('6505','石化')]},
+    '1303': {'role': '塑膠加工', 'upstream': [('1301','石化原料')], 'downstream': []},
+    '1326': {'role': '石化中游', 'upstream': [('1301','石化原料')], 'downstream': []},
+    '6505': {'role': '石化', 'upstream': [('1301','石化原料')], 'downstream': []},
+    # 航運
+    '2603': {'role': '貨櫃航運', 'upstream': [], 'downstream': []},
+    '2609': {'role': '貨櫃航運', 'upstream': [], 'downstream': []},
+    '2615': {'role': '貨櫃航運', 'upstream': [], 'downstream': []},
+    # 通訊
+    '2412': {'role': '電信', 'upstream': [], 'downstream': []},
+    '4904': {'role': '電信', 'upstream': [], 'downstream': []},
+    # AI server chain
+    '2345': {'role': '網通', 'upstream': [], 'downstream': [('2382','伺服器')]},
+    '4938': {'role': '代工組裝', 'upstream': [('2330','晶圓代工')], 'downstream': []},
+    '3034': {'role': 'IC 設計', 'upstream': [], 'downstream': [('2330','晶圓代工')]},
+}
+
+@app.route('/api/supply_chain')
+def supply_chain():
+    """Get supply chain relationships for a stock"""
+    code = request.args.get('code', '').strip()
+    if not code:
+        return jsonify({'error': 'need code'}), 400
+    chain = SUPPLY_CHAIN.get(code)
+    name = STOCK_NAMES.get(code, code)
+    if not chain:
+        return jsonify({'code': code, 'name': name, 'has_chain': False, 'role': '', 'upstream': [], 'downstream': []})
+    upstream = [{'code': c, 'name': STOCK_NAMES.get(c, c), 'role': r} for c, r in chain['upstream']]
+    downstream = [{'code': c, 'name': STOCK_NAMES.get(c, c), 'role': r} for c, r in chain['downstream']]
+    return jsonify({
+        'code': code, 'name': name,
+        'has_chain': True,
+        'role': chain['role'],
+        'upstream': upstream,
+        'downstream': downstream,
+    })
+
+@app.route('/api/stock_news')
+def stock_news():
+    """Fetch news for a specific stock"""
+    code = request.args.get('code', '').strip()
+    if not code:
+        return jsonify([])
+    name = STOCK_NAMES.get(code, _name_cache.get(code, code))
+    import xml.etree.ElementTree as ET
+    results = []
+    for q in [name, f'{code} 股票']:
+        try:
+            url = f'https://news.google.com/rss/search?q={q}+台股&hl=zh-TW&gl=TW&ceid=TW:zh-Hant'
+            r = requests.get(url, headers=HEADERS, timeout=8)
+            root = ET.fromstring(r.content)
+            for item in root.findall('.//item')[:8]:
+                t = item.find('title')
+                l = item.find('link')
+                p = item.find('pubDate')
+                s = item.find('source')
+                if t is not None and t.text:
+                    results.append({
+                        'title': t.text,
+                        'link': l.text if l is not None else '',
+                        'date': p.text if p is not None else '',
+                        'source': s.text if s is not None else '',
+                    })
+        except Exception:
+            continue
+    # Deduplicate
+    seen = set()
+    unique = []
+    for n in results:
+        if n['title'] not in seen:
+            seen.add(n['title'])
+            unique.append(n)
+    return jsonify(unique[:6])
+
+@app.route('/api/entry_signals')
+def entry_signals():
+    """Scan popular stocks for technical entry signals (RSI, KD, MACD, MA, Bollinger)"""
+    import math
+
+    def _fetch_hist(code, market, months=6):
+        """Fetch historical close/high/low/volume data"""
+        records = []
+        today = datetime.date.today()
+        for m in range(months):
+            d = today.replace(day=1) - datetime.timedelta(days=m * 28)
+            try:
+                if market == 'tse':
+                    url = f'https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&date={d.strftime("%Y%m01")}&stockNo={code}'
+                else:
+                    roc_y = d.year - 1911
+                    url = f'https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={roc_y}/{d.month:02d}/01&stkno={code}&_=1'
+                data = cached_get(url, ttl=3600)
+                rows = data.get('data', []) if market == 'tse' else data.get('aaData', [])
+                for row in rows:
+                    try:
+                        if market == 'tse':
+                            parts = row[0].split('/')
+                            y = int(parts[0]) + 1911
+                            dt = f'{y}-{int(parts[1]):02d}-{int(parts[2]):02d}'
+                            c = float(row[6].replace(',', ''))
+                            h = float(row[4].replace(',', ''))
+                            lo = float(row[5].replace(',', ''))
+                            v = int(row[1].replace(',', ''))
+                            op = float(row[3].replace(',', ''))
+                        else:
+                            parts = str(row[0]).split('/')
+                            y = int(parts[0]) + 1911
+                            dt = f'{y}-{int(parts[1]):02d}-{int(parts[2]):02d}'
+                            c = float(str(row[6]).replace(',', ''))
+                            h = float(str(row[4]).replace(',', ''))
+                            lo = float(str(row[5]).replace(',', ''))
+                            v = int(str(row[1]).replace(',', ''))
+                            op = float(str(row[3]).replace(',', ''))
+                        records.append({'date': dt, 'close': c, 'high': h, 'low': lo, 'volume': v, 'open': op})
+                    except (ValueError, IndexError):
+                        continue
+            except Exception:
+                continue
+        records.sort(key=lambda x: x['date'])
+        # Deduplicate
+        seen = set()
+        unique = []
+        for r in records:
+            if r['date'] not in seen:
+                seen.add(r['date'])
+                unique.append(r)
+        return unique
+
+    def calc_rsi(closes, period=14):
+        if len(closes) < period + 1:
+            return None
+        gains, losses = [], []
+        for i in range(1, len(closes)):
+            diff = closes[i] - closes[i - 1]
+            gains.append(max(diff, 0))
+            losses.append(max(-diff, 0))
+        if len(gains) < period:
+            return None
+        avg_gain = sum(gains[-period:]) / period
+        avg_loss = sum(losses[-period:]) / period
+        if avg_loss == 0:
+            return 100.0
+        rs = avg_gain / avg_loss
+        return round(100 - (100 / (1 + rs)), 1)
+
+    def calc_kd(highs, lows, closes, k_period=9, k_smooth=3, d_smooth=3):
+        if len(closes) < k_period + k_smooth + d_smooth:
+            return None, None
+        rsv_list = []
+        for i in range(k_period - 1, len(closes)):
+            window_h = max(highs[i - k_period + 1:i + 1])
+            window_l = min(lows[i - k_period + 1:i + 1])
+            if window_h == window_l:
+                rsv_list.append(50)
+            else:
+                rsv_list.append((closes[i] - window_l) / (window_h - window_l) * 100)
+        # Smooth K
+        k_val = 50
+        k_list = []
+        for rsv in rsv_list:
+            k_val = k_val * 2 / 3 + rsv / 3
+            k_list.append(k_val)
+        # Smooth D
+        d_val = 50
+        d_list = []
+        for k in k_list:
+            d_val = d_val * 2 / 3 + k / 3
+            d_list.append(d_val)
+        return round(k_list[-1], 1), round(d_list[-1], 1)
+
+    def calc_macd(closes, fast=12, slow=26, signal=9):
+        if len(closes) < slow + signal:
+            return None, None, None
+        def ema(data, period):
+            multiplier = 2 / (period + 1)
+            result = [data[0]]
+            for i in range(1, len(data)):
+                result.append(data[i] * multiplier + result[-1] * (1 - multiplier))
+            return result
+        ema_fast = ema(closes, fast)
+        ema_slow = ema(closes, slow)
+        dif = [ema_fast[i] - ema_slow[i] for i in range(len(closes))]
+        dem = ema(dif[slow - 1:], signal)
+        dif_recent = dif[-1]
+        dem_recent = dem[-1]
+        histogram = dif_recent - dem_recent
+        return round(dif_recent, 2), round(dem_recent, 2), round(histogram, 2)
+
+    def calc_bollinger(closes, period=20, num_std=2):
+        if len(closes) < period:
+            return None, None, None
+        window = closes[-period:]
+        ma = sum(window) / period
+        std = math.sqrt(sum((x - ma) ** 2 for x in window) / period)
+        return round(ma, 2), round(ma + num_std * std, 2), round(ma - num_std * std, 2)
+
+    # Scan stocks
+    scan_list = [(c, 'tse') for c in POPULAR_TSE[:30]] + [(c, 'otc') for c in POPULAR_OTC[:15]]
+    results = []
+
+    # Get realtime prices
+    rt_map = {}
+    rt_stocks = fetch_stocks(scan_list)
+    for s in rt_stocks:
+        if s and s.get('code'):
+            rt_map[s['code']] = s
+
+    for code, market in scan_list:
+        try:
+            hist = _fetch_hist(code, market, months=5)
+            if len(hist) < 40:
+                continue
+
+            closes = [r['close'] for r in hist]
+            highs = [r['high'] for r in hist]
+            lows = [r['low'] for r in hist]
+            volumes = [r['volume'] for r in hist]
+
+            rt = rt_map.get(code, {})
+            price = rt.get('price', closes[-1])
+            change_pct = rt.get('change_pct', 0)
+            name = rt.get('name') or STOCK_NAMES.get(code, code)
+
+            signals = []
+            entry_price = price
+            stop_loss = None
+            target = None
+
+            # 1. RSI
+            rsi = calc_rsi(closes)
+            prev_rsi = calc_rsi(closes[:-1]) if len(closes) > 15 else None
+
+            if rsi is not None:
+                if rsi <= 30:
+                    signals.append({'type': 'RSI 超賣', 'icon': '📉', 'desc': f'RSI {rsi}，已進入超賣區，反彈機率高', 'weight': 3})
+                elif rsi <= 40 and prev_rsi and prev_rsi < rsi:
+                    signals.append({'type': 'RSI 回升', 'icon': '📈', 'desc': f'RSI {rsi}，從低檔回升中', 'weight': 2})
+
+            # 2. KD
+            k, d = calc_kd(highs, lows, closes)
+            prev_k, prev_d = calc_kd(highs[:-1], lows[:-1], closes[:-1]) if len(closes) > 15 else (None, None)
+
+            if k is not None and d is not None:
+                if k < 25 and d < 25:
+                    signals.append({'type': 'KD 超賣', 'icon': '🔻', 'desc': f'K={k} D={d}，KD 低檔超賣區', 'weight': 3})
+                if prev_k is not None and prev_d is not None:
+                    if prev_k <= prev_d and k > d and k < 50:
+                        signals.append({'type': 'KD 黃金交叉', 'icon': '✨', 'desc': f'K={k} 上穿 D={d}，低檔黃金交叉', 'weight': 4})
+
+            # 3. MACD
+            dif, dem, hist_val = calc_macd(closes)
+            prev_dif, prev_dem, prev_hist = calc_macd(closes[:-1]) if len(closes) > 36 else (None, None, None)
+
+            if hist_val is not None and prev_hist is not None:
+                if prev_hist < 0 and hist_val >= 0:
+                    signals.append({'type': 'MACD 翻多', 'icon': '🔄', 'desc': f'MACD 柱翻正 ({hist_val:+.2f})，多方動能啟動', 'weight': 4})
+                elif hist_val < 0 and hist_val > prev_hist and dif < 0:
+                    signals.append({'type': 'MACD 收斂', 'icon': '🔍', 'desc': f'空方動能減弱 (DIF={dif:.2f})，可能即將翻多', 'weight': 2})
+
+            # 4. MA support
+            if len(closes) >= 20:
+                ma5 = sum(closes[-5:]) / 5
+                ma10 = sum(closes[-10:]) / 10
+                ma20 = sum(closes[-20:]) / 20
+                ma60 = sum(closes[-60:]) / 60 if len(closes) >= 60 else None
+
+                # Price near MA20 support (within 2%)
+                if abs(price - ma20) / ma20 < 0.02 and price >= ma20:
+                    signals.append({'type': 'MA20 支撐', 'icon': '🛡️', 'desc': f'股價貼近 20 日均線 ({ma20:.0f})，獲得支撐', 'weight': 3})
+
+                # Price near MA60 support
+                if ma60 and abs(price - ma60) / ma60 < 0.02 and price >= ma60:
+                    signals.append({'type': 'MA60 支撐', 'icon': '🏰', 'desc': f'股價貼近季線 ({ma60:.0f})，強支撐位', 'weight': 4})
+
+                # MA golden cross (short-term)
+                if len(closes) > 20:
+                    prev_ma5 = sum(closes[-6:-1]) / 5
+                    prev_ma10 = sum(closes[-11:-1]) / 10
+                    if prev_ma5 <= prev_ma10 and ma5 > ma10:
+                        signals.append({'type': '均線黃金交叉', 'icon': '💫', 'desc': f'MA5 ({ma5:.0f}) 上穿 MA10 ({ma10:.0f})', 'weight': 3})
+
+            # 5. Bollinger Band
+            bb_mid, bb_upper, bb_lower = calc_bollinger(closes)
+            if bb_lower is not None:
+                if price <= bb_lower * 1.01:
+                    signals.append({'type': '布林帶下緣', 'icon': '📊', 'desc': f'觸及布林帶下緣 ({bb_lower:.0f})，可能反彈', 'weight': 3})
+
+            # 6. Volume contraction + price stable (accumulation)
+            if len(volumes) >= 10:
+                avg_vol_5 = sum(volumes[-5:]) / 5
+                avg_vol_20 = sum(volumes[-20:]) / 20 if len(volumes) >= 20 else avg_vol_5
+                price_range_5 = (max(closes[-5:]) - min(closes[-5:])) / closes[-5] * 100 if closes[-5] else 0
+
+                if avg_vol_5 < avg_vol_20 * 0.6 and price_range_5 < 3:
+                    signals.append({'type': '量縮價穩', 'icon': '🤫', 'desc': f'近5日量縮至均量 {avg_vol_5/avg_vol_20*100:.0f}%，價格穩定，可能在吸籌', 'weight': 2})
+
+                # Volume breakout
+                if volumes[-1] > avg_vol_20 * 2 and closes[-1] > closes[-2] and change_pct > 2:
+                    signals.append({'type': '量能突破', 'icon': '💥', 'desc': f'今日量能為均量 {volumes[-1]/avg_vol_20:.1f} 倍，帶量上攻', 'weight': 3})
+
+            # 7. Trend signals — detect healthy uptrend stocks
+            if len(closes) >= 20:
+                ma5 = sum(closes[-5:]) / 5
+                ma10 = sum(closes[-10:]) / 10
+                ma20 = sum(closes[-20:]) / 20
+                ma60 = sum(closes[-60:]) / 60 if len(closes) >= 60 else None
+                if price > ma5 > ma10 > ma20:
+                    signals.append({'type': '均線多頭排列', 'icon': '🚀', 'desc': f'股價站穩所有短中期均線之上，趨勢向上', 'weight': 3})
+                if ma60 and price > ma60 * 1.05 and price > ma20:
+                    signals.append({'type': '站穩季線上方', 'icon': '🏔️', 'desc': f'股價高於季線 ({ma60:.0f}) 5% 以上，中期趨勢穩健', 'weight': 2})
+
+            # 8. MACD bullish trend (ongoing, not just crossover)
+            if dif is not None and dem is not None and hist_val is not None:
+                if dif > 0 and dem > 0 and dif > dem and hist_val > 0:
+                    if not any(s['type'] == 'MACD 翻多' for s in signals):
+                        signals.append({'type': 'MACD 多方運行', 'icon': '📈', 'desc': f'DIF({dif:.1f}) > DEA({dem:.1f})，多方動能持續', 'weight': 2})
+
+            # Filter: volume-only on overbought = chasing, not entry
+            non_vol_signals = [s for s in signals if s['type'] != '量能突破']
+            if not non_vol_signals and signals:
+                # Only volume breakout signal — check if already overbought
+                if (rsi and rsi > 60) or (k and k > 70) or change_pct > 7:
+                    signals = [{'type': '追高警示', 'icon': '⚠️',
+                                'desc': f'今日大漲 {change_pct:+.1f}%，RSI={rsi}，指標已偏高，不建議追高',
+                                'weight': -1}]
+
+            if not signals or (len(signals) == 1 and signals[0].get('weight', 0) < 0):
+                continue
+
+            # Calculate stop-loss & target (smart levels)
+            total_weight = sum(max(s['weight'], 0) for s in signals)
+            _ma5 = sum(closes[-5:]) / 5 if len(closes) >= 5 else price
+            _ma10 = sum(closes[-10:]) / 10 if len(closes) >= 10 else price
+            _ma20 = sum(closes[-20:]) / 20 if len(closes) >= 20 else price
+
+            # ATR-based volatility
+            _atr_vals = [max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1])) for i in range(-min(14, len(closes)-1), 0)]
+            _atr = sum(_atr_vals) / len(_atr_vals) if _atr_vals else price * 0.03
+
+            # Find nearest support within 3-10% of price
+            _stops = []
+            if len(lows) >= 3:
+                _rl = min(lows[-3:])
+                if _rl < price:
+                    _stops.append(round(_rl * 0.99, 2))
+            for _mv in [_ma5, _ma10, _ma20]:
+                if _mv < price:
+                    _stops.append(round(_mv * 0.98, 2))
+            _stops.append(round(price - 2 * _atr, 2))
+            _valid = [s for s in _stops if price * 0.90 <= s <= price * 0.97]
+            stop_loss = max(_valid) if _valid else round(price * 0.95, 2)
+
+            target = round(price + (price - stop_loss) * 2, 2)
+            risk_reward = round((target - price) / (price - stop_loss), 1) if price > stop_loss else 0
+
+            results.append({
+                'code': code,
+                'name': name,
+                'market': market,
+                'price': price,
+                'change_pct': change_pct,
+                'signals': signals,
+                'signal_count': len(signals),
+                'total_weight': total_weight,
+                'entry': round(price, 2),
+                'stop_loss': stop_loss,
+                'target': target,
+                'risk_reward': risk_reward,
+                'rsi': rsi,
+                'k': k,
+                'd': d,
+                'macd_hist': hist_val,
+            })
+        except Exception:
+            continue
+
+    # Sort by total weight (signal strength)
+    results.sort(key=lambda x: x['total_weight'], reverse=True)
+    return jsonify(results[:20])
+
+@app.route('/api/stock_signal')
+def stock_signal():
+    """Comprehensive stock analysis: technical + fundamental + institutional + margin + news"""
+    import math
+    code = request.args.get('code', '').strip()
+    if not code:
+        return jsonify({'error': 'need code'}), 400
+
+    # Determine market
+    market = 'otc' if code in POPULAR_OTC else 'tse'
+    # Try to fetch — if tse fails, try otc
+    def _fetch_hist_single(code, market, months=6):
+        records = []
+        today = datetime.date.today()
+        for m in range(months):
+            d = today.replace(day=1) - datetime.timedelta(days=m * 28)
+            try:
+                if market == 'tse':
+                    url = f'https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&date={d.strftime("%Y%m01")}&stockNo={code}'
+                else:
+                    roc_y = d.year - 1911
+                    url = f'https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={roc_y}/{d.month:02d}/01&stkno={code}&_=1'
+                data = cached_get(url, ttl=3600)
+                rows = data.get('data', []) if market == 'tse' else data.get('aaData', [])
+                for row in rows:
+                    try:
+                        if market == 'tse':
+                            parts = row[0].split('/')
+                            y = int(parts[0]) + 1911
+                            dt = f'{y}-{int(parts[1]):02d}-{int(parts[2]):02d}'
+                            c = float(row[6].replace(',', ''))
+                            h = float(row[4].replace(',', ''))
+                            lo = float(row[5].replace(',', ''))
+                            v = int(row[1].replace(',', ''))
+                            op = float(row[3].replace(',', ''))
+                        else:
+                            parts = str(row[0]).split('/')
+                            y = int(parts[0]) + 1911
+                            dt = f'{y}-{int(parts[1]):02d}-{int(parts[2]):02d}'
+                            c = float(str(row[6]).replace(',', ''))
+                            h = float(str(row[4]).replace(',', ''))
+                            lo = float(str(row[5]).replace(',', ''))
+                            v = int(str(row[1]).replace(',', ''))
+                            op = float(str(row[3]).replace(',', ''))
+                        records.append({'date': dt, 'close': c, 'high': h, 'low': lo, 'volume': v, 'open': op})
+                    except (ValueError, IndexError):
+                        continue
+            except Exception:
+                continue
+        records.sort(key=lambda x: x['date'])
+        seen = set()
+        unique = []
+        for r in records:
+            if r['date'] not in seen:
+                seen.add(r['date'])
+                unique.append(r)
+        return unique
+
+    # Helper functions (same as entry_signals)
+    def calc_rsi(closes, period=14):
+        if len(closes) < period + 1:
+            return None
+        gains, losses = [], []
+        for i in range(1, len(closes)):
+            diff = closes[i] - closes[i - 1]
+            gains.append(max(diff, 0))
+            losses.append(max(-diff, 0))
+        if len(gains) < period:
+            return None
+        avg_gain = sum(gains[-period:]) / period
+        avg_loss = sum(losses[-period:]) / period
+        if avg_loss == 0:
+            return 100.0
+        rs = avg_gain / avg_loss
+        return round(100 - (100 / (1 + rs)), 1)
+
+    def calc_kd(highs, lows, closes, k_period=9, k_smooth=3, d_smooth=3):
+        if len(closes) < k_period + k_smooth + d_smooth:
+            return None, None
+        rsv_list = []
+        for i in range(k_period - 1, len(closes)):
+            window_h = max(highs[i - k_period + 1:i + 1])
+            window_l = min(lows[i - k_period + 1:i + 1])
+            if window_h == window_l:
+                rsv_list.append(50)
+            else:
+                rsv_list.append((closes[i] - window_l) / (window_h - window_l) * 100)
+        k_val = 50
+        k_list = []
+        for rsv in rsv_list:
+            k_val = k_val * 2 / 3 + rsv / 3
+            k_list.append(k_val)
+        d_val = 50
+        d_list = []
+        for k in k_list:
+            d_val = d_val * 2 / 3 + k / 3
+            d_list.append(d_val)
+        return round(k_list[-1], 1), round(d_list[-1], 1)
+
+    def calc_macd(closes, fast=12, slow=26, signal=9):
+        if len(closes) < slow + signal:
+            return None, None, None
+        def ema(data, period):
+            multiplier = 2 / (period + 1)
+            result = [data[0]]
+            for i in range(1, len(data)):
+                result.append(data[i] * multiplier + result[-1] * (1 - multiplier))
+            return result
+        ema_fast = ema(closes, fast)
+        ema_slow = ema(closes, slow)
+        dif = [ema_fast[i] - ema_slow[i] for i in range(len(closes))]
+        dem = ema(dif[slow - 1:], signal)
+        return round(dif[-1], 2), round(dem[-1], 2), round(dif[-1] - dem[-1], 2)
+
+    def calc_bollinger(closes, period=20, num_std=2):
+        if len(closes) < period:
+            return None, None, None
+        window = closes[-period:]
+        ma = sum(window) / period
+        std = math.sqrt(sum((x - ma) ** 2 for x in window) / period)
+        return round(ma, 2), round(ma + num_std * std, 2), round(ma - num_std * std, 2)
+
+    # Try tse first, if no data try otc
+    hist = _fetch_hist_single(code, market, months=5)
+    if len(hist) < 20 and market == 'tse':
+        market = 'otc'
+        hist = _fetch_hist_single(code, market, months=5)
+
+    # Yahoo Finance fallback (same as /api/historical)
+    if len(hist) < 20:
+        for suffix in [('.TW' if market == 'tse' else '.TWO'), ('.TWO' if market == 'tse' else '.TW')]:
+            try:
+                url = f'https://query1.finance.yahoo.com/v8/finance/chart/{code}{suffix}?interval=1d&range=6mo'
+                d = cached_get(url, ttl=3600)
+                chart_result = d.get('chart', {}).get('result')
+                if not chart_result:
+                    continue
+                result = chart_result[0]
+                timestamps = result.get('timestamp', [])
+                quotes = result.get('indicators', {}).get('quote', [{}])[0]
+                for i, ts in enumerate(timestamps):
+                    try:
+                        dt = datetime.datetime.fromtimestamp(ts)
+                        o = quotes.get('open', [])[i]
+                        h = quotes.get('high', [])[i]
+                        l = quotes.get('low', [])[i]
+                        c = quotes.get('close', [])[i]
+                        v = quotes.get('volume', [])[i]
+                        if o and h and l and c:
+                            hist.append({'date': dt.strftime('%Y-%m-%d'), 'open': round(float(o), 2),
+                                         'high': round(float(h), 2), 'low': round(float(l), 2),
+                                         'close': round(float(c), 2), 'volume': int(v) if v else 0})
+                    except (IndexError, TypeError):
+                        continue
+                if len(hist) >= 20:
+                    if suffix == '.TWO':
+                        market = 'otc'
+                    break
+            except Exception:
+                continue
+        # Deduplicate and sort
+        seen = set()
+        unique = []
+        for r in sorted(hist, key=lambda x: x['date']):
+            if r['date'] not in seen:
+                seen.add(r['date'])
+                unique.append(r)
+        hist = unique
+
+    name = STOCK_NAMES.get(code) or _name_cache.get(code, code)
+
+    if len(hist) < 20:
+        return jsonify({'code': code, 'name': name, 'error': 'insufficient_data',
+                        'message': f'歷史資料不足（僅 {len(hist)} 天），無法計算技術指標'})
+
+    closes = [r['close'] for r in hist]
+    highs = [r['high'] for r in hist]
+    lows = [r['low'] for r in hist]
+    volumes = [r['volume'] for r in hist]
+
+    # Get realtime price
+    rt_list = fetch_stocks([(code, market)])
+    rt = rt_list[0] if rt_list else {}
+    price = rt.get('price', closes[-1])
+    change = rt.get('change', 0)
+    change_pct = rt.get('change_pct', 0)
+    if rt.get('name'):
+        name = rt['name']
+
+    signals = []
+
+    # 1. RSI
+    rsi = calc_rsi(closes)
+    prev_rsi = calc_rsi(closes[:-1]) if len(closes) > 15 else None
+    if rsi is not None:
+        if rsi <= 30:
+            signals.append({'type': 'RSI 超賣', 'icon': '📉', 'desc': f'RSI {rsi}，已進入超賣區，反彈機率高', 'weight': 3, 'bullish': True})
+        elif rsi <= 40 and prev_rsi and prev_rsi < rsi:
+            signals.append({'type': 'RSI 回升', 'icon': '📈', 'desc': f'RSI {rsi}，從低檔回升中', 'weight': 2, 'bullish': True})
+        elif rsi >= 70:
+            signals.append({'type': 'RSI 過熱', 'icon': '🔥', 'desc': f'RSI {rsi}，已進入過熱區，注意回檔風險', 'weight': -2, 'bullish': False})
+        elif rsi >= 60 and prev_rsi and prev_rsi > rsi:
+            signals.append({'type': 'RSI 轉弱', 'icon': '📉', 'desc': f'RSI {rsi}，從高檔滑落中', 'weight': -1, 'bullish': False})
+
+    # 2. KD
+    k, d = calc_kd(highs, lows, closes)
+    prev_k, prev_d = calc_kd(highs[:-1], lows[:-1], closes[:-1]) if len(closes) > 15 else (None, None)
+    if k is not None and d is not None:
+        if k < 25 and d < 25:
+            signals.append({'type': 'KD 超賣', 'icon': '🔻', 'desc': f'K={k} D={d}，KD 低檔超賣區', 'weight': 3, 'bullish': True})
+        elif k > 80 and d > 80:
+            signals.append({'type': 'KD 過熱', 'icon': '🔺', 'desc': f'K={k} D={d}，KD 高檔過熱區', 'weight': -2, 'bullish': False})
+        if prev_k is not None and prev_d is not None:
+            if prev_k <= prev_d and k > d and k < 50:
+                signals.append({'type': 'KD 黃金交叉', 'icon': '✨', 'desc': f'K={k} 上穿 D={d}，低檔黃金交叉', 'weight': 4, 'bullish': True})
+            elif prev_k >= prev_d and k < d and k > 50:
+                signals.append({'type': 'KD 死亡交叉', 'icon': '💀', 'desc': f'K={k} 下穿 D={d}，高檔死亡交叉', 'weight': -3, 'bullish': False})
+
+    # 3. MACD
+    dif, dem, hist_val = calc_macd(closes)
+    prev_dif, prev_dem, prev_hist = calc_macd(closes[:-1]) if len(closes) > 36 else (None, None, None)
+    if hist_val is not None and prev_hist is not None:
+        if prev_hist < 0 and hist_val >= 0:
+            signals.append({'type': 'MACD 翻多', 'icon': '🔄', 'desc': f'MACD 柱翻正 ({hist_val:+.2f})，多方動能啟動', 'weight': 4, 'bullish': True})
+        elif prev_hist > 0 and hist_val <= 0:
+            signals.append({'type': 'MACD 翻空', 'icon': '🔄', 'desc': f'MACD 柱翻負 ({hist_val:+.2f})，空方動能啟動', 'weight': -3, 'bullish': False})
+        elif hist_val < 0 and hist_val > prev_hist and dif < 0:
+            signals.append({'type': 'MACD 收斂', 'icon': '🔍', 'desc': f'空方動能減弱 (DIF={dif:.2f})，可能即將翻多', 'weight': 2, 'bullish': True})
+        elif hist_val > 0 and hist_val < prev_hist and dif > 0:
+            signals.append({'type': 'MACD 動能減弱', 'icon': '📉', 'desc': f'多方動能減弱 (DIF={dif:.2f})，注意是否翻空', 'weight': -1, 'bullish': False})
+
+    # 4. MA
+    ma_data = {}
+    if len(closes) >= 5:
+        ma_data['ma5'] = round(sum(closes[-5:]) / 5, 2)
+    if len(closes) >= 10:
+        ma_data['ma10'] = round(sum(closes[-10:]) / 10, 2)
+    if len(closes) >= 20:
+        ma_data['ma20'] = round(sum(closes[-20:]) / 20, 2)
+    if len(closes) >= 60:
+        ma_data['ma60'] = round(sum(closes[-60:]) / 60, 2)
+
+    ma20 = ma_data.get('ma20')
+    ma60 = ma_data.get('ma60')
+    if ma20 and abs(price - ma20) / ma20 < 0.02 and price >= ma20:
+        signals.append({'type': 'MA20 支撐', 'icon': '🛡️', 'desc': f'股價貼近 20 日均線 ({ma20:.0f})，獲得支撐', 'weight': 3, 'bullish': True})
+    elif ma20 and price < ma20 * 0.97:
+        signals.append({'type': '跌破 MA20', 'icon': '⬇️', 'desc': f'股價跌破 20 日均線 ({ma20:.0f})，短線偏弱', 'weight': -2, 'bullish': False})
+
+    if ma60 and abs(price - ma60) / ma60 < 0.02 and price >= ma60:
+        signals.append({'type': 'MA60 支撐', 'icon': '🏰', 'desc': f'股價貼近季線 ({ma60:.0f})，強支撐位', 'weight': 4, 'bullish': True})
+    elif ma60 and price < ma60 * 0.97:
+        signals.append({'type': '跌破季線', 'icon': '⬇️', 'desc': f'股價跌破季線 ({ma60:.0f})，中期轉弱', 'weight': -3, 'bullish': False})
+
+    if len(closes) > 20 and ma_data.get('ma5') and ma_data.get('ma10'):
+        prev_ma5 = sum(closes[-6:-1]) / 5
+        prev_ma10 = sum(closes[-11:-1]) / 10
+        ma5 = ma_data['ma5']
+        ma10 = ma_data['ma10']
+        if prev_ma5 <= prev_ma10 and ma5 > ma10:
+            signals.append({'type': '均線黃金交叉', 'icon': '💫', 'desc': f'MA5 ({ma5:.0f}) 上穿 MA10 ({ma10:.0f})', 'weight': 3, 'bullish': True})
+        elif prev_ma5 >= prev_ma10 and ma5 < ma10:
+            signals.append({'type': '均線死亡交叉', 'icon': '💀', 'desc': f'MA5 ({ma5:.0f}) 下穿 MA10 ({ma10:.0f})', 'weight': -2, 'bullish': False})
+
+    # 5. Bollinger
+    bb_mid, bb_upper, bb_lower = calc_bollinger(closes)
+    if bb_lower is not None:
+        if price <= bb_lower * 1.01:
+            signals.append({'type': '布林帶下緣', 'icon': '📊', 'desc': f'觸及布林帶下緣 ({bb_lower:.0f})，可能反彈', 'weight': 3, 'bullish': True})
+        elif price >= bb_upper * 0.99:
+            # Don't flag upper band as bearish when stock is clearly oversold (contradictory)
+            if rsi is not None and rsi < 35:
+                pass  # Skip — oversold stock touching narrow upper band is NOT bearish
+            else:
+                signals.append({'type': '布林帶上緣', 'icon': '📊', 'desc': f'觸及布林帶上緣 ({bb_upper:.0f})，注意壓力', 'weight': -1, 'bullish': False})
+
+    # 6. Volume
+    if len(volumes) >= 20:
+        avg_vol_5 = sum(volumes[-5:]) / 5
+        avg_vol_20 = sum(volumes[-20:]) / 20
+        if avg_vol_5 < avg_vol_20 * 0.6:
+            price_range_5 = (max(closes[-5:]) - min(closes[-5:])) / closes[-5] * 100
+            if price_range_5 < 3:
+                signals.append({'type': '量縮價穩', 'icon': '🤫', 'desc': f'近5日量縮至均量 {avg_vol_5/avg_vol_20*100:.0f}%，價格穩定，可能在吸籌', 'weight': 2, 'bullish': True})
+        if volumes[-1] > avg_vol_20 * 2 and closes[-1] > closes[-2]:
+            signals.append({'type': '量能突破', 'icon': '💥', 'desc': f'今日量能為均量 {volumes[-1]/avg_vol_20:.1f} 倍，帶量上攻', 'weight': 3, 'bullish': True})
+
+    # 7. Trend signals — detect healthy uptrend/downtrend stocks that don't hit extremes
+    if ma_data.get('ma5') and ma_data.get('ma10') and ma_data.get('ma20'):
+        ma5v, ma10v, ma20v = ma_data['ma5'], ma_data['ma10'], ma_data['ma20']
+        if price > ma5v > ma10v > ma20v:
+            signals.append({'type': '均線多頭排列', 'icon': '🚀', 'desc': f'股價站穩所有短中期均線之上，趨勢向上', 'weight': 3, 'bullish': True})
+        elif price < ma5v < ma10v < ma20v:
+            signals.append({'type': '均線空頭排列', 'icon': '📉', 'desc': f'股價跌破所有短中期均線，趨勢向下', 'weight': -3, 'bullish': False})
+
+    if ma60 and price > ma60 * 1.05 and price > ma_data.get('ma20', 0):
+        signals.append({'type': '站穩季線上方', 'icon': '🏔️', 'desc': f'股價高於季線 ({ma60:.0f}) 5% 以上，中期趨勢穩健', 'weight': 2, 'bullish': True})
+
+    # 8. MACD trend — ongoing bullish/bearish momentum (not just crossover)
+    if dif is not None and dem is not None and hist_val is not None:
+        if dif > 0 and dem > 0 and dif > dem and hist_val > 0:
+            # Don't double-count if MACD翻多 already triggered
+            if not any(s['type'] == 'MACD 翻多' for s in signals):
+                signals.append({'type': 'MACD 多方運行', 'icon': '📈', 'desc': f'DIF({dif:.1f}) > DEA({dem:.1f})，多方動能持續', 'weight': 2, 'bullish': True})
+        elif dif < 0 and dem < 0 and dif < dem and hist_val < 0:
+            if not any(s['type'] == 'MACD 翻空' for s in signals):
+                signals.append({'type': 'MACD 空方運行', 'icon': '📉', 'desc': f'DIF({dif:.1f}) < DEA({dem:.1f})，空方動能持續', 'weight': -2, 'bullish': False})
+
+    # ═══════════════════════════════════════════
+    # SMART LEVELS: Entry / Stop / Target (巴菲特式分析)
+    # 基於支撐壓力、均線、波動度、基本面來計算
+    # ═══════════════════════════════════════════
+    ma5_val = ma_data.get('ma5', price)
+    ma10_val = ma_data.get('ma10', price)
+    ma20_val = ma_data.get('ma20', price)
+    ma60_val = ma_data.get('ma60')
+
+    # --- ATR (Average True Range) for volatility ---
+    atr_vals = []
+    for i in range(-min(14, len(closes)-1), 0):
+        tr = max(highs[i] - lows[i],
+                 abs(highs[i] - closes[i-1]),
+                 abs(lows[i] - closes[i-1]))
+        atr_vals.append(tr)
+    atr = sum(atr_vals) / len(atr_vals) if atr_vals else price * 0.03
+
+    # --- ENTRY (建議進場) ---
+    # If overbought: suggest waiting for pullback to nearest MA
+    # If near support: suggest current price
+    # If oversold: current price is good
+    entry_price = price
+    entry_note = '現價進場'
+    if rsi and rsi > 75:
+        # Overbought — suggest waiting for pullback
+        if ma5_val < price * 0.97:
+            entry_price = round(ma5_val, 2)
+            entry_note = '建議回測MA5再進場'
+        elif ma10_val < price * 0.95:
+            entry_price = round(ma10_val, 2)
+            entry_note = '建議回測MA10再進場'
+        else:
+            entry_price = round(price * 0.97, 2)
+            entry_note = '短線過熱，建議回檔3%再進'
+    elif rsi and rsi < 30:
+        entry_note = '超賣區，可積極進場'
+    elif ma20_val and abs(price - ma20_val) / ma20_val < 0.02:
+        entry_note = '貼近MA20支撐，適合進場'
+
+    # --- STOP LOSS (停損) based on support levels below ENTRY ---
+    # All calculations relative to entry_price, not current price
+    ep = entry_price  # shorthand
+    stop_candidates = []
+    if len(lows) >= 3:
+        prev_low = min(lows[-3:])
+        if prev_low < ep:
+            stop_candidates.append((round(prev_low * 0.99, 2), '近3日低點下方'))
+    for mv, mn in [(ma5_val, 'MA5'), (ma10_val, 'MA10'), (ma20_val, 'MA20')]:
+        if mv < ep:
+            stop_candidates.append((round(mv * 0.98, 2), f'跌破{mn}'))
+    if bb_lower and bb_lower < ep:
+        stop_candidates.append((round(bb_lower * 0.99, 2), '跌破布林下緣'))
+    atr_stop = round(ep - 2 * atr, 2)
+    stop_candidates.append((atr_stop, f'2倍ATR({atr:.1f})'))
+
+    # Filter: 3%~10% below entry price
+    valid = [(s, n) for s, n in stop_candidates if ep * 0.90 <= s <= ep * 0.97]
+    if valid:
+        stop_loss, stop_note = max(valid, key=lambda x: x[0])
+    else:
+        close_stops = [(s, n) for s, n in stop_candidates if s >= ep * 0.88 and s < ep]
+        if close_stops:
+            stop_loss, stop_note = max(close_stops, key=lambda x: x[0])
+        else:
+            stop_loss = round(ep * 0.95, 2)
+            stop_note = '預設5%停損'
+
+    # --- TARGET (目標價) based on resistance above ENTRY ---
+    target_candidates = []
+    recent_high = max(highs[-20:]) if len(highs) >= 20 else max(highs[-5:])
+    if recent_high > ep * 1.03:
+        target_candidates.append((round(recent_high, 2), '近期高點'))
+    if bb_upper and bb_upper > ep * 1.02:
+        target_candidates.append((round(bb_upper, 2), '布林帶上緣'))
+    rr_target = round(ep + (ep - stop_loss) * 2, 2)
+    target_candidates.append((rr_target, '風報比1:2'))
+    rr3_target = round(ep + (ep - stop_loss) * 3, 2)
+    target_candidates.append((rr3_target, '風報比1:3'))
+    if ma60_val and ep > ma60_val:
+        target_candidates.append((round(ep * 1.10, 2), '趨勢延伸+10%'))
+    # When entry adjusted down (overbought), add current price as recovery target
+    if ep < price * 0.95:
+        target_candidates.append((round(price, 2), '回測前高水準'))
+
+    target_candidates.sort(key=lambda x: x[0])
+    min_target = ep + (ep - stop_loss) * 2
+    # When entry is adjusted down, minimum target should be at least the current price
+    if ep < price * 0.95:
+        min_target = max(min_target, price)
+    good_targets = [(t, n) for t, n in target_candidates if t >= min_target and t <= ep * 1.50]
+    if good_targets:
+        target, target_note = good_targets[0]
+    else:
+        # Fallback: use RR 1:2 or current price, whichever is higher
+        if ep < price * 0.95 and price > rr_target:
+            target = round(price, 2)
+            target_note = '回測前高水準'
+        else:
+            target = rr_target
+            target_note = '風報比1:2'
+
+    risk = ep - stop_loss
+    risk_reward = round((target - ep) / risk, 1) if risk > 0 else 0
+    stop_pct = round((ep - stop_loss) / ep * 100, 1)
+    target_pct = round((target - ep) / ep * 100, 1)
+
+    # ═══════════════════════════════════════════
+    # PART 2: Fundamental analysis (基本面)
+    # ═══════════════════════════════════════════
+    fund_signals = []
+    fund_map = _fetch_pe_pb_yield()
+    rev_map = _fetch_revenue_growth()
+    fund = fund_map.get(code, {})
+    rev = rev_map.get(code, {})
+    pe = fund.get('pe')
+    pb = fund.get('pb')
+    dy = fund.get('yield')
+    yoy = rev.get('yoy')
+    mom = rev.get('mom')
+
+    if pe is not None:
+        if pe < 0:
+            fund_signals.append({'type': '本益比為負', 'icon': '⚠️', 'desc': f'PE {pe:.1f}，公司處於虧損', 'weight': -3, 'bullish': False, 'cat': 'fundamental'})
+        elif pe <= 15:
+            fund_signals.append({'type': 'PE 低估', 'icon': '💰', 'desc': f'本益比 {pe:.1f}，估值偏低有吸引力', 'weight': 3, 'bullish': True, 'cat': 'fundamental'})
+        elif pe <= 25:
+            fund_signals.append({'type': 'PE 合理', 'icon': '📊', 'desc': f'本益比 {pe:.1f}，估值合理', 'weight': 1, 'bullish': True, 'cat': 'fundamental'})
+        elif pe > 50:
+            fund_signals.append({'type': 'PE 過高', 'icon': '⚠️', 'desc': f'本益比 {pe:.1f}，估值偏高需留意', 'weight': -2, 'bullish': False, 'cat': 'fundamental'})
+        elif pe > 30:
+            fund_signals.append({'type': 'PE 偏高', 'icon': '📊', 'desc': f'本益比 {pe:.1f}，估值略高', 'weight': -1, 'bullish': False, 'cat': 'fundamental'})
+
+    if dy is not None and dy >= 4:
+        fund_signals.append({'type': '高殖利率', 'icon': '🏦', 'desc': f'殖利率 {dy:.1f}%，配息豐厚', 'weight': 2, 'bullish': True, 'cat': 'fundamental'})
+
+    if yoy is not None:
+        if yoy >= 20:
+            fund_signals.append({'type': '營收高成長', 'icon': '🚀', 'desc': f'營收年增 {yoy:+.1f}%，成長強勁', 'weight': 3, 'bullish': True, 'cat': 'fundamental'})
+        elif yoy >= 5:
+            fund_signals.append({'type': '營收穩健', 'icon': '📈', 'desc': f'營收年增 {yoy:+.1f}%', 'weight': 1, 'bullish': True, 'cat': 'fundamental'})
+        elif yoy <= -20:
+            fund_signals.append({'type': '營收衰退', 'icon': '📉', 'desc': f'營收年減 {yoy:.1f}%，衰退幅度大', 'weight': -3, 'bullish': False, 'cat': 'fundamental'})
+        elif yoy <= -5:
+            fund_signals.append({'type': '營收下滑', 'icon': '📉', 'desc': f'營收年減 {yoy:.1f}%', 'weight': -1, 'bullish': False, 'cat': 'fundamental'})
+
+    # ═══════════════════════════════════════════
+    # PART 3: Institutional / Chip analysis (籌碼面)
+    # ═══════════════════════════════════════════
+    chip_signals = []
+    inst_map = _fetch_institutional()
+    inst = inst_map.get(code)
+    chip_data = None
+    try:
+        # Fetch chip analysis data (consecutive buying)
+        today = datetime.date.today()
+        chip_daily = []
+        for dd in range(10):
+            chip_day = today - datetime.timedelta(days=dd)
+            if chip_day.weekday() >= 5:
+                continue
+            try:
+                date_str = f'{chip_day.year - 1911}/{chip_day.month:02d}/{chip_day.day:02d}'
+                t86_url = f'https://www.twse.com.tw/fund/T86?response=json&date={chip_day.strftime("%Y%m%d")}&selectType=ALL'
+                t86_data = cached_get(t86_url, ttl=3600)
+                for row in t86_data.get('data', []):
+                    if row[0].strip() == code:
+                        foreign = int(row[4].replace(',', ''))
+                        trust = int(row[10].replace(',', ''))
+                        total = int(row[18].replace(',', ''))
+                        chip_daily.append({'date': chip_day.strftime('%m/%d'), 'foreign': foreign // 1000,
+                                           'trust': trust // 1000, 'total': total // 1000})
+                        break
+            except Exception:
+                continue
+        # Count consecutive buy days
+        consec_buy = 0
+        for cd in chip_daily:
+            if cd['total'] > 0:
+                consec_buy += 1
+            else:
+                break
+        chip_data = {'daily': chip_daily[:5], 'consecutive_buy': consec_buy}
+    except Exception:
+        pass
+
+    if inst:
+        total_net = inst.get('total', 0) // 1000  # Convert to 張
+        foreign_net = inst.get('foreign', 0) // 1000
+        trust_net = inst.get('trust', 0) // 1000
+        if total_net > 5000:
+            chip_signals.append({'type': '法人大買', 'icon': '🏛️', 'desc': f'三大法人買超 {total_net:,} 張', 'weight': 3, 'bullish': True, 'cat': 'chip'})
+        elif total_net > 1000:
+            chip_signals.append({'type': '法人買超', 'icon': '🏛️', 'desc': f'三大法人買超 {total_net:,} 張', 'weight': 2, 'bullish': True, 'cat': 'chip'})
+        elif total_net < -5000:
+            chip_signals.append({'type': '法人大賣', 'icon': '🏛️', 'desc': f'三大法人賣超 {abs(total_net):,} 張', 'weight': -3, 'bullish': False, 'cat': 'chip'})
+        elif total_net < -1000:
+            chip_signals.append({'type': '法人賣超', 'icon': '🏛️', 'desc': f'三大法人賣超 {abs(total_net):,} 張', 'weight': -2, 'bullish': False, 'cat': 'chip'})
+
+        if foreign_net > 0 and trust_net > 0:
+            chip_signals.append({'type': '外資投信同買', 'icon': '🤝', 'desc': f'外資+{foreign_net:,}張 投信+{trust_net:,}張 同步看多', 'weight': 2, 'bullish': True, 'cat': 'chip'})
+
+    if chip_data and chip_data['consecutive_buy'] >= 3:
+        cb = chip_data['consecutive_buy']
+        chip_signals.append({'type': f'連{cb}日買超', 'icon': '🔥', 'desc': f'法人連續 {cb} 個交易日買超，籌碼集中', 'weight': min(cb, 4), 'bullish': True, 'cat': 'chip'})
+
+    # ═══════════════════════════════════════════
+    # PART 4: Margin / Retail sentiment (散戶面)
+    # ═══════════════════════════════════════════
+    margin_signals = []
+    margin_data = None
+    try:
+        margin_url = f'https://www.twse.com.tw/exchangeReport/MI_MARGN?response=json&date={datetime.date.today().strftime("%Y%m%d")}&selectType=ALL'
+        mdata = cached_get(margin_url, ttl=3600)
+        for row in mdata.get('data', []):
+            if row[0].strip() == code:
+                margin_buy = int(row[2].replace(',', ''))
+                margin_sell = int(row[3].replace(',', ''))
+                margin_bal = int(row[4].replace(',', ''))
+                margin_chg = margin_buy - margin_sell
+                margin_data = {'balance': margin_bal, 'change': margin_chg}
+                if margin_chg > 3000:
+                    margin_signals.append({'type': '融資大增', 'icon': '⚠️', 'desc': f'融資增 {margin_chg:,} 張，散戶積極追買', 'weight': -2, 'bullish': False, 'cat': 'sentiment'})
+                elif margin_chg > 1000:
+                    margin_signals.append({'type': '融資增加', 'icon': '📊', 'desc': f'融資增 {margin_chg:,} 張，散戶偏多', 'weight': -1, 'bullish': False, 'cat': 'sentiment'})
+                elif margin_chg < -2000:
+                    margin_signals.append({'type': '融資大減', 'icon': '💡', 'desc': f'融資減 {abs(margin_chg):,} 張，散戶出場，籌碼沉澱', 'weight': 2, 'bullish': True, 'cat': 'sentiment'})
+                break
+    except Exception:
+        pass
+
+    # ═══════════════════════════════════════════
+    # PART 5: News (新聞面)
+    # ═══════════════════════════════════════════
+    news = []
+    try:
+        import xml.etree.ElementTree as ET
+        stock_name = name or code
+        for q in [stock_name, f'{code} 股票']:
+            nurl = f'https://news.google.com/rss/search?q={q}+台股&hl=zh-TW&gl=TW&ceid=TW:zh-Hant'
+            nr = requests.get(nurl, headers=HEADERS, timeout=5)
+            root = ET.fromstring(nr.content)
+            for item in root.findall('.//item')[:5]:
+                t = item.find('title')
+                src = item.find('source')
+                pd = item.find('pubDate')
+                if t is not None and t.text:
+                    news.append({'title': t.text, 'source': src.text if src is not None else '',
+                                 'date': pd.text[:16] if pd is not None else ''})
+            if news:
+                break
+        seen_titles = set()
+        news = [n for n in news if n['title'] not in seen_titles and not seen_titles.add(n['title'])][:4]
+    except Exception:
+        pass
+
+    # ═══════════════════════════════════════════
+    # OVERALL: Combine all dimensions
+    # ═══════════════════════════════════════════
+    all_signals = signals + fund_signals + chip_signals + margin_signals
+
+    bullish_w = sum(s['weight'] for s in all_signals if s.get('bullish', True) and s.get('weight', 0) > 0)
+    bearish_w = abs(sum(s['weight'] for s in all_signals if not s.get('bullish', True) and s.get('weight', 0) < 0))
+    total_score = bullish_w - bearish_w
+
+    # Dimension scores
+    tech_score = sum(s['weight'] for s in signals)
+    fund_score = sum(s['weight'] for s in fund_signals)
+    chip_score = sum(s['weight'] for s in chip_signals)
+    sent_score = sum(s['weight'] for s in margin_signals)
+
+    if total_score >= 10:
+        verdict = '強力進場'
+        verdict_icon = '🟢'
+        verdict_desc = '多維度指標共振，技術+基本+籌碼面皆看多'
+    elif total_score >= 5:
+        verdict = '建議進場'
+        verdict_icon = '🟢'
+        verdict_desc = '整體偏多，可分批佈局'
+    elif total_score >= 0:
+        verdict = '觀望為主'
+        verdict_icon = '🟡'
+        verdict_desc = '訊號不明確，建議等待更多確認'
+    elif total_score >= -5:
+        verdict = '暫不進場'
+        verdict_icon = '🟠'
+        verdict_desc = '整體偏弱，不建議現在進場'
+    else:
+        verdict = '建議迴避'
+        verdict_icon = '🔴'
+        verdict_desc = '多維度指標轉空，風險偏高'
+
+    return jsonify({
+        'code': code, 'name': name, 'market': market,
+        'price': price, 'change': change, 'change_pct': change_pct,
+        # Technical signals
+        'signals': signals,
+        'signal_count': len(all_signals),
+        'bullish_weight': bullish_w,
+        'bearish_weight': bearish_w,
+        'total_score': total_score,
+        'verdict': verdict, 'verdict_icon': verdict_icon, 'verdict_desc': verdict_desc,
+        'entry': entry_price, 'entry_note': entry_note,
+        'stop_loss': stop_loss, 'stop_note': stop_note, 'stop_pct': stop_pct,
+        'target': target, 'target_note': target_note, 'target_pct': target_pct,
+        'risk_reward': risk_reward, 'atr': round(atr, 2),
+        'rsi': rsi, 'k': k, 'd': d,
+        'dif': dif, 'dem': dem, 'macd_hist': hist_val,
+        'ma': ma_data,
+        'bollinger': {'mid': bb_mid, 'upper': bb_upper, 'lower': bb_lower} if bb_mid else None,
+        'data_points': len(hist),
+        'latest_date': hist[-1]['date'] if hist else '',
+        # Dimension scores
+        'tech_score': tech_score,
+        'fund_score': fund_score,
+        'chip_score': chip_score,
+        'sent_score': sent_score,
+        # Fundamental
+        'fundamental': fund_signals,
+        'pe': pe, 'pb': pb, 'dividend_yield': dy,
+        'rev_yoy': yoy, 'rev_mom': mom,
+        # Institutional / Chip
+        'chip': chip_signals,
+        'chip_data': chip_data,
+        'institutional': {'foreign': inst.get('foreign', 0) // 1000 if inst else None,
+                          'trust': inst.get('trust', 0) // 1000 if inst else None,
+                          'total': inst.get('total', 0) // 1000 if inst else None} if inst else None,
+        # Margin
+        'margin_signals': margin_signals,
+        'margin': margin_data,
+        # News
+        'news': news,
+    })
 
 @app.route('/api/network_info')
 def network_info():
@@ -1028,4 +3489,5 @@ if __name__ == '__main__':
     print(f"   本機：http://localhost:5566")
     print(f"   區網：http://{local_ip}:5566")
     print(f"   外網：連線建立中...")
-    app.run(host='0.0.0.0', port=5566, debug=False)
+    port = int(os.environ.get('PORT', 5566))
+    app.run(host='0.0.0.0', port=port, debug=False)

@@ -7,3 +7,4 @@ tunnel_url.txt
 ngrok_domain.txt
 *.log
 .DS_Store
+.vercel
