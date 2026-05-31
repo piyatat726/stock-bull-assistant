@@ -2708,31 +2708,89 @@ def entry_signals():
             if not signals or (len(signals) == 1 and signals[0].get('weight', 0) < 0):
                 continue
 
-            # Calculate stop-loss & target (smart levels)
+            # Calculate stop-loss & target (smart levels — same logic as stock_signal)
             total_weight = sum(max(s['weight'], 0) for s in signals)
             _ma5 = sum(closes[-5:]) / 5 if len(closes) >= 5 else price
             _ma10 = sum(closes[-10:]) / 10 if len(closes) >= 10 else price
             _ma20 = sum(closes[-20:]) / 20 if len(closes) >= 20 else price
+            _ma60 = sum(closes[-60:]) / 60 if len(closes) >= 60 else None
+            _bb_upper = bb_upper
 
             # ATR-based volatility
             _atr_vals = [max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1])) for i in range(-min(14, len(closes)-1), 0)]
-            _atr = sum(_atr_vals) / len(_atr_vals) if _atr_vals else price * 0.03
+            _atr = round(sum(_atr_vals) / len(_atr_vals), 2) if _atr_vals else round(price * 0.03, 2)
 
-            # Find nearest support within 3-10% of price
+            # Entry adjustment (same logic as stock_signal)
+            entry_price = round(price, 2)
+            entry_note = '現價進場'
+            if rsi and rsi > 75:
+                if _ma5 < price * 0.97:
+                    entry_price = round(_ma5, 2)
+                    entry_note = '建議回測MA5再進場'
+                elif _ma10 < price * 0.95:
+                    entry_price = round(_ma10, 2)
+                    entry_note = '建議回測MA10再進場'
+                else:
+                    entry_price = round(price * 0.97, 2)
+                    entry_note = '短線過熱，建議回檔3%再進'
+            elif rsi and rsi < 30:
+                entry_note = '超賣區，可積極進場'
+            ep = entry_price
+
+            # Find nearest support within 3-10% of ENTRY price
             _stops = []
+            stop_note = ''
             if len(lows) >= 3:
                 _rl = min(lows[-3:])
-                if _rl < price:
-                    _stops.append(round(_rl * 0.99, 2))
-            for _mv in [_ma5, _ma10, _ma20]:
-                if _mv < price:
-                    _stops.append(round(_mv * 0.98, 2))
-            _stops.append(round(price - 2 * _atr, 2))
-            _valid = [s for s in _stops if price * 0.90 <= s <= price * 0.97]
-            stop_loss = max(_valid) if _valid else round(price * 0.95, 2)
+                if _rl < ep:
+                    _stops.append((round(_rl * 0.99, 2), '近3日低點下方'))
+            for _mv, _mn in [(_ma5, 'MA5'), (_ma10, 'MA10'), (_ma20, 'MA20')]:
+                if _mv < ep:
+                    _stops.append((round(_mv * 0.98, 2), f'跌破{_mn}'))
+            _stops.append((round(ep - 2 * _atr, 2), f'2倍ATR({_atr:.1f})'))
+            _valid = [(s, n) for s, n in _stops if ep * 0.90 <= s <= ep * 0.97]
+            if _valid:
+                stop_loss, stop_note = max(_valid, key=lambda x: x[0])
+            else:
+                _close = [(s, n) for s, n in _stops if s >= ep * 0.88 and s < ep]
+                if _close:
+                    stop_loss, stop_note = max(_close, key=lambda x: x[0])
+                else:
+                    stop_loss = round(ep * 0.95, 2)
+                    stop_note = '預設5%停損'
 
-            target = round(price + (price - stop_loss) * 2, 2)
-            risk_reward = round((target - price) / (price - stop_loss), 1) if price > stop_loss else 0
+            # Target (multi-candidate, same as stock_signal)
+            _tgt_cands = []
+            _recent_high = max(highs[-20:]) if len(highs) >= 20 else max(highs[-5:])
+            if _recent_high > ep * 1.03:
+                _tgt_cands.append((round(_recent_high, 2), '近期高點'))
+            if _bb_upper and _bb_upper > ep * 1.02:
+                _tgt_cands.append((round(_bb_upper, 2), '布林帶上緣'))
+            _rr2 = round(ep + (ep - stop_loss) * 2, 2)
+            _tgt_cands.append((_rr2, '風報比1:2'))
+            _rr3 = round(ep + (ep - stop_loss) * 3, 2)
+            _tgt_cands.append((_rr3, '風報比1:3'))
+            if _ma60 and ep > _ma60:
+                _tgt_cands.append((round(ep * 1.10, 2), '趨勢延伸+10%'))
+            if ep < price * 0.95:
+                _tgt_cands.append((round(price, 2), '回測前高水準'))
+            _tgt_cands.sort(key=lambda x: x[0])
+            _min_tgt = ep + (ep - stop_loss) * 2
+            if ep < price * 0.95:
+                _min_tgt = max(_min_tgt, price)
+            _good = [(t, n) for t, n in _tgt_cands if t >= _min_tgt and t <= ep * 1.50]
+            if _good:
+                target, target_note = _good[0]
+            else:
+                if ep < price * 0.95 and price > _rr2:
+                    target, target_note = round(price, 2), '回測前高水準'
+                else:
+                    target, target_note = _rr2, '風報比1:2'
+
+            _risk = ep - stop_loss
+            risk_reward = round((target - ep) / _risk, 1) if _risk > 0 else 0
+            stop_pct = round((ep - stop_loss) / ep * 100, 1)
+            target_pct = round((target - ep) / ep * 100, 1)
 
             results.append({
                 'code': code,
@@ -2743,13 +2801,21 @@ def entry_signals():
                 'signals': signals,
                 'signal_count': len(signals),
                 'total_weight': total_weight,
-                'entry': round(price, 2),
+                'entry': entry_price,
+                'entry_note': entry_note,
                 'stop_loss': stop_loss,
+                'stop_pct': stop_pct,
+                'stop_note': stop_note,
                 'target': target,
+                'target_pct': target_pct,
+                'target_note': target_note,
                 'risk_reward': risk_reward,
+                'atr': _atr,
                 'rsi': rsi,
                 'k': k,
                 'd': d,
+                'dif': dif,
+                'dem': dem,
                 'macd_hist': hist_val,
             })
         except Exception:

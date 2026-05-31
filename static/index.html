@@ -2159,7 +2159,7 @@ async function loadSignals(){
       let indHtml='';
       if(s.rsi!=null)indHtml+=`<span class="sig-ind">RSI <span>${s.rsi}</span></span>`;
       if(s.k!=null&&s.d!=null)indHtml+=`<span class="sig-ind">K <span>${s.k}</span> D <span>${s.d}</span></span>`;
-      if(s.macd_hist!=null)indHtml+=`<span class="sig-ind">MACD <span style="color:${s.macd_hist>=0?'var(--green)':'var(--red)'}">${s.macd_hist>=0?'+':''}${s.macd_hist}</span></span>`;
+      if(s.macd_hist!=null)indHtml+=`<span class="sig-ind">MACD <span style="color:${s.macd_hist>=0?'var(--green)':'var(--red)'}">DIF ${s.dif||'-'} / DEA ${s.dem||'-'} / 柱 ${s.macd_hist>=0?'+':''}${s.macd_hist}</span></span>`;
 
       return`<div class="sig-card">
         <div class="sig-head">
@@ -2175,10 +2175,11 @@ async function loadSignals(){
         <div class="sig-tags">${tagsHtml}</div>
         <div class="sig-desc">${descsHtml}</div>
         <div class="sig-levels">
-          <div class="sig-lvl entry"><div class="sl-label">建議進場</div><div class="sl-val">${s.entry}</div></div>
-          <div class="sig-lvl stop"><div class="sl-label">停損參考</div><div class="sl-val">${s.stop_loss}</div></div>
-          <div class="sig-lvl target"><div class="sl-label">目標價</div><div class="sl-val">${s.target}</div></div>
+          <div class="sig-lvl entry"><div class="sl-label">建議進場</div><div class="sl-val">${s.entry}</div><div style="font-size:9px;color:var(--dim);margin-top:2px">${s.entry_note||''}</div></div>
+          <div class="sig-lvl stop"><div class="sl-label">停損參考</div><div class="sl-val">${s.stop_loss}</div><div style="font-size:9px;color:var(--red);margin-top:2px">-${s.stop_pct||''}% ${s.stop_note||''}</div></div>
+          <div class="sig-lvl target"><div class="sl-label">目標價</div><div class="sl-val">${s.target}</div><div style="font-size:9px;color:var(--green);margin-top:2px">+${s.target_pct||''}% ${s.target_note||''}</div></div>
         </div>
+        <div style="text-align:center;font-size:10px;color:var(--dim);margin-top:4px">風報比 1:${s.risk_reward} · ATR ${s.atr||'-'}</div>
         <div class="sig-meter">
           <div class="sm-label">訊號強度</div>
           <div class="sm-bar"><div class="sm-fill" style="width:${pct}%;background:${barColor}"></div></div>
