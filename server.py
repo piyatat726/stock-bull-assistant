@@ -3345,14 +3345,24 @@ def stock_signal():
     margin_signals = []
     margin_data = None
     try:
-        margin_url = f'https://www.twse.com.tw/exchangeReport/MI_MARGN?response=json&date={datetime.date.today().strftime("%Y%m%d")}&selectType=ALL'
-        mdata = cached_get(margin_url, ttl=3600)
-        for row in mdata.get('data', []):
+        margin_rows = []
+        for days_back in range(5):
+            md = datetime.date.today() - datetime.timedelta(days=days_back)
+            if md.weekday() >= 5:
+                continue
+            margin_url = f'https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?response=json&date={md.strftime("%Y%m%d")}&selectType=STOCK'
+            mdata = cached_get(margin_url, ttl=3600)
+            margin_tables = mdata.get('tables', [])
+            margin_rows = margin_tables[1].get('data', []) if len(margin_tables) >= 2 else []
+            if margin_rows:
+                break
+        for row in margin_rows:
             if row[0].strip() == code:
                 margin_buy = int(row[2].replace(',', ''))
                 margin_sell = int(row[3].replace(',', ''))
-                margin_bal = int(row[4].replace(',', ''))
-                margin_chg = margin_buy - margin_sell
+                margin_bal = int(row[6].replace(',', ''))  # 今日餘額 is col 6
+                prev_bal = int(row[5].replace(',', ''))     # 前日餘額
+                margin_chg = margin_bal - prev_bal           # Accurate daily change
                 margin_data = {'balance': margin_bal, 'change': margin_chg}
                 if margin_chg > 3000:
                     margin_signals.append({'type': '融資大增', 'icon': '⚠️', 'desc': f'融資增 {margin_chg:,} 張，散戶積極追買', 'weight': -2, 'bullish': False, 'cat': 'sentiment'})
