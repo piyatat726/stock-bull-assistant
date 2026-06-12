@@ -2825,6 +2825,281 @@ def entry_signals():
     results.sort(key=lambda x: x['total_weight'], reverse=True)
     return jsonify(results[:20])
 
+@app.route('/api/portfolio_signals')
+def portfolio_signals():
+    """Lightweight batch analysis for user's holdings: trend + entry/stop/target + plain-language verdict"""
+    import math
+    codes_param = request.args.get('codes', '').strip()
+    markets_param = request.args.get('markets', '').strip()
+    if not codes_param:
+        return jsonify([])
+    codes = [c.strip() for c in codes_param.split(',') if c.strip()][:20]
+    markets_list = [m.strip() for m in markets_param.split(',')] if markets_param else []
+    pairs = []
+    for i, c in enumerate(codes):
+        m = markets_list[i] if i < len(markets_list) and markets_list[i] in ('tse', 'otc') else ('otc' if c in POPULAR_OTC else 'tse')
+        pairs.append((c, m))
+
+    # Realtime prices (single batched call)
+    rt_map = {}
+    for s in fetch_stocks(pairs):
+        if s and s.get('code'):
+            rt_map[s['code']] = s
+
+    def calc_rsi(closes, period=14):
+        if len(closes) < period + 1:
+            return None
+        gains, losses = [], []
+        for i in range(1, len(closes)):
+            diff = closes[i] - closes[i - 1]
+            gains.append(max(diff, 0))
+            losses.append(max(-diff, 0))
+        avg_gain = sum(gains[-period:]) / period
+        avg_loss = sum(losses[-period:]) / period
+        if avg_loss == 0:
+            return 100.0
+        rs = avg_gain / avg_loss
+        return round(100 - (100 / (1 + rs)), 1)
+
+    def calc_kd(highs, lows, closes, k_period=9):
+        if len(closes) < k_period + 6:
+            return None, None
+        rsv_list = []
+        for i in range(k_period - 1, len(closes)):
+            wh = max(highs[i - k_period + 1:i + 1])
+            wl = min(lows[i - k_period + 1:i + 1])
+            rsv_list.append(50 if wh == wl else (closes[i] - wl) / (wh - wl) * 100)
+        k_val = 50
+        k_list = []
+        for rsv in rsv_list:
+            k_val = k_val * 2 / 3 + rsv / 3
+            k_list.append(k_val)
+        d_val = 50
+        for k in k_list:
+            d_val = d_val * 2 / 3 + k / 3
+        return round(k_list[-1], 1), round(d_val, 1)
+
+    def _fetch_hist_pf(code, market):
+        records = []
+        today = datetime.date.today()
+        for m in range(5):
+            d = today.replace(day=1) - datetime.timedelta(days=m * 28)
+            try:
+                if market == 'tse':
+                    url = f'https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&date={d.strftime("%Y%m01")}&stockNo={code}'
+                else:
+                    roc_y = d.year - 1911
+                    url = f'https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={roc_y}/{d.month:02d}/01&stkno={code}&_=1'
+                data = cached_get(url, ttl=3600)
+                rows = data.get('data', []) if market == 'tse' else data.get('aaData', [])
+                for row in rows:
+                    try:
+                        parts = str(row[0]).split('/')
+                        y = int(parts[0]) + 1911
+                        dt = f'{y}-{int(parts[1]):02d}-{int(parts[2]):02d}'
+                        records.append({'date': dt,
+                                        'close': float(str(row[6]).replace(',', '')),
+                                        'high': float(str(row[4]).replace(',', '')),
+                                        'low': float(str(row[5]).replace(',', '')),
+                                        'volume': int(str(row[1]).replace(',', ''))})
+                    except (ValueError, IndexError):
+                        continue
+            except Exception:
+                continue
+        # Yahoo fallback if TWSE failed
+        if len(records) < 20:
+            for suffix in [('.TW' if market == 'tse' else '.TWO'), ('.TWO' if market == 'tse' else '.TW')]:
+                try:
+                    url = f'https://query1.finance.yahoo.com/v8/finance/chart/{code}{suffix}?interval=1d&range=6mo'
+                    d = cached_get(url, ttl=3600)
+                    cr = d.get('chart', {}).get('result')
+                    if not cr:
+                        continue
+                    ts_list = cr[0].get('timestamp', [])
+                    q = cr[0].get('indicators', {}).get('quote', [{}])[0]
+                    for i, ts in enumerate(ts_list):
+                        try:
+                            h, lo, c = q.get('high', [])[i], q.get('low', [])[i], q.get('close', [])[i]
+                            v = q.get('volume', [])[i]
+                            if h and lo and c:
+                                records.append({'date': datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d'),
+                                                'close': round(float(c), 2), 'high': round(float(h), 2),
+                                                'low': round(float(lo), 2), 'volume': int(v) if v else 0})
+                        except (IndexError, TypeError):
+                            continue
+                    if len(records) >= 20:
+                        break
+                except Exception:
+                    continue
+        records.sort(key=lambda x: x['date'])
+        seen = set()
+        unique = []
+        for r in records:
+            if r['date'] not in seen:
+                seen.add(r['date'])
+                unique.append(r)
+        return unique
+
+    def analyze(pair):
+        code, market = pair
+        try:
+            hist = _fetch_hist_pf(code, market)
+            rt = rt_map.get(code, {})
+            name = rt.get('name') or STOCK_NAMES.get(code, code)
+            if len(hist) < 20:
+                return {'code': code, 'name': name, 'market': market,
+                        'price': rt.get('price', 0), 'change': rt.get('change', 0),
+                        'change_pct': rt.get('change_pct', 0), 'error': 'insufficient_data'}
+            closes = [r['close'] for r in hist]
+            highs = [r['high'] for r in hist]
+            lows = [r['low'] for r in hist]
+            price = rt.get('price') or closes[-1]
+            change = rt.get('change', 0)
+            change_pct = rt.get('change_pct', 0)
+
+            ma5 = sum(closes[-5:]) / 5
+            ma10 = sum(closes[-10:]) / 10
+            ma20 = sum(closes[-20:]) / 20
+            ma60 = sum(closes[-60:]) / 60 if len(closes) >= 60 else None
+            rsi = calc_rsi(closes)
+            k, d = calc_kd(highs, lows, closes)
+
+            # ── Trend: score-based, plain language ──
+            t_score = 0
+            t_score += 1 if price > ma20 else -1
+            t_score += 1 if ma5 > ma20 else -1
+            if ma60:
+                t_score += 1 if price > ma60 else -1
+            t_score += 1 if closes[-1] >= closes[-6] else -1  # 5-day momentum
+            if t_score >= 2:
+                trend, trend_label = 'up', '上升趨勢'
+                trend_desc = '股價站上主要均線，趨勢向上'
+                if price > ma5 > ma10 > ma20:
+                    trend_desc = '多頭排列，短中期動能都向上'
+            elif t_score <= -2:
+                trend, trend_label = 'down', '下降趨勢'
+                trend_desc = '股價跌破主要均線，趨勢偏弱'
+            else:
+                trend, trend_label = 'flat', '盤整中'
+                trend_desc = '均線糾結，方向不明，等待表態'
+
+            # ── ATR ──
+            atr_vals = [max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
+                        for i in range(-min(14, len(closes) - 1), 0)]
+            atr = sum(atr_vals) / len(atr_vals) if atr_vals else price * 0.03
+
+            # ── Smart entry (same as stock_signal) ──
+            entry_price = round(price, 2)
+            entry_note = '現價即可進場'
+            if rsi and rsi > 75:
+                if ma5 < price * 0.97:
+                    entry_price = round(ma5, 2)
+                    entry_note = '短線過熱，等回到 5 日均線再買'
+                elif ma10 < price * 0.95:
+                    entry_price = round(ma10, 2)
+                    entry_note = '短線過熱，等回到 10 日均線再買'
+                else:
+                    entry_price = round(price * 0.97, 2)
+                    entry_note = '短線過熱，等回檔 3% 再買'
+            elif rsi and rsi < 30:
+                entry_note = '超賣區，可分批佈局'
+            elif abs(price - ma20) / ma20 < 0.02 and price >= ma20:
+                entry_note = '貼近月線支撐，進場時機佳'
+            ep = entry_price
+
+            # ── Stop loss ──
+            stops = []
+            if len(lows) >= 3:
+                rl = min(lows[-3:])
+                if rl < ep:
+                    stops.append((round(rl * 0.99, 2), '跌破近 3 日低點'))
+            for mv, mn in [(ma5, '5日線'), (ma10, '10日線'), (ma20, '月線')]:
+                if mv < ep:
+                    stops.append((round(mv * 0.98, 2), f'跌破{mn}'))
+            stops.append((round(ep - 2 * atr, 2), '波動度推算'))
+            valid = [(s, n) for s, n in stops if ep * 0.90 <= s <= ep * 0.97]
+            if valid:
+                stop_loss, stop_note = max(valid, key=lambda x: x[0])
+            else:
+                close_stops = [(s, n) for s, n in stops if ep * 0.88 <= s < ep]
+                if close_stops:
+                    stop_loss, stop_note = max(close_stops, key=lambda x: x[0])
+                else:
+                    stop_loss, stop_note = round(ep * 0.95, 2), '固定 5% 停損'
+
+            # ── Target ──
+            tgts = []
+            recent_high = max(highs[-20:])
+            if recent_high > ep * 1.03:
+                tgts.append((round(recent_high, 2), '挑戰近期高點'))
+            rr2 = round(ep + (ep - stop_loss) * 2, 2)
+            tgts.append((rr2, '風報比 1:2'))
+            rr3 = round(ep + (ep - stop_loss) * 3, 2)
+            tgts.append((rr3, '風報比 1:3'))
+            if ma60 and ep > ma60:
+                tgts.append((round(ep * 1.10, 2), '趨勢延伸 +10%'))
+            if ep < price * 0.95:
+                tgts.append((round(price, 2), '回到目前價位'))
+            tgts.sort(key=lambda x: x[0])
+            min_tgt = ep + (ep - stop_loss) * 2
+            if ep < price * 0.95:
+                min_tgt = max(min_tgt, price)
+            good = [(t, n) for t, n in tgts if min_tgt <= t <= ep * 1.50]
+            if good:
+                target, target_note = good[0]
+            else:
+                target, target_note = (round(price, 2), '回到目前價位') if (ep < price * 0.95 and price > rr2) else (rr2, '風報比 1:2')
+
+            risk = ep - stop_loss
+            risk_reward = round((target - ep) / risk, 1) if risk > 0 else 0
+
+            # ── Plain-language action verdict: 現在可以買嗎？──
+            if price < stop_loss:
+                action, action_label = 'below_stop', '🛑 跌破停損價位'
+                action_desc = f'已跌破停損參考價 {stop_loss}，持有者注意風險控管'
+            elif price >= target:
+                action, action_label = 'hit_target', '🎉 已達目標價'
+                action_desc = f'已達目標價 {target}，可考慮分批獲利了結'
+            elif price >= target * 0.97:
+                action, action_label = 'near_target', '🎯 接近目標價'
+                action_desc = f'距離目標價 {target} 不到 3%，留意賣壓'
+            elif trend == 'down':
+                action, action_label = 'watch', '👀 先觀望'
+                action_desc = '趨勢向下，等止穩訊號再考慮進場'
+            elif ep < price * 0.97:
+                action, action_label = 'wait_pullback', '⏳ 等回檔再買'
+                action_desc = f'短線漲多，建議等回到 {entry_price} 附近再進場'
+            elif trend == 'up':
+                action, action_label = 'buy_zone', '✅ 可進場區間'
+                action_desc = f'趨勢向上且價位合理，可分批進場'
+            else:
+                action, action_label = 'neutral', '🤔 可小量試單'
+                action_desc = '盤整中，可小量佈局等待方向確認'
+
+            return {
+                'code': code, 'name': name, 'market': market,
+                'price': price, 'change': change, 'change_pct': change_pct,
+                'trend': trend, 'trend_label': trend_label, 'trend_desc': trend_desc,
+                'action': action, 'action_label': action_label, 'action_desc': action_desc,
+                'entry': entry_price, 'entry_note': entry_note,
+                'stop_loss': stop_loss, 'stop_note': stop_note,
+                'stop_pct': round((ep - stop_loss) / ep * 100, 1),
+                'target': target, 'target_note': target_note,
+                'target_pct': round((target - ep) / ep * 100, 1),
+                'risk_reward': risk_reward,
+                'rsi': rsi, 'k': k, 'd': d,
+                'ma5': round(ma5, 2), 'ma20': round(ma20, 2),
+                'ma60': round(ma60, 2) if ma60 else None,
+                'spark': [round(c, 2) for c in closes[-30:]],
+            }
+        except Exception:
+            return None
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = [r for r in pool.map(analyze, pairs) if r]
+    return jsonify(results)
+
 @app.route('/api/stock_signal')
 def stock_signal():
     """Comprehensive stock analysis: technical + fundamental + institutional + margin + news"""
