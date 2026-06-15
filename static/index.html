@@ -1650,12 +1650,14 @@ async function loadNewsPicks(){
     $('news-picks-section').style.display='block';
     $('news-picks-grid').innerHTML='<div class="grid g4" style="display:grid;gap:10px">'+data.map(s=>{
       const c=cc(s.change);
-      const newsHtml=s.news.map(n=>`<a href="${n.link}" target="_blank" rel="noopener" title="${n.title}"><span class="np-src">${n.source||'新聞'}</span> ${n.title}</a>`).join('');
+      const newsHtml=s.news.map(n=>`<a href="${n.link}" target="_blank" rel="noopener" title="${n.title}"><span class="np-src">${n.source||'新聞'}</span> ${n.title}${n.date?` <span style="color:var(--dim)">· ${timeAgo(n.date)}</span>`:''}</a>`).join('');
+      const fresh=s.fresh_hours!=null?(s.fresh_hours<24?`${Math.round(s.fresh_hours)}小時內`:`${Math.round(s.fresh_hours/24)}天內`):'';
       return`<div class="np-card">
         <div class="np-head"><div><div class="nm">${s.name}</div><div class="cd">${s.code}</div></div><div class="pr ${c}">${s.price}</div></div>
-        <div style="display:flex;align-items:center;gap:6px">
+        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
           <span class="ctag ${c}">${sg(s.change_pct)}${s.change_pct}%</span>
-          <span style="font-size:10px;padding:2px 6px;border-radius:4px;background:rgba(59,130,246,.1);color:var(--blue);font-weight:600">📰 新聞提及 ${s.score} 次</span>
+          <span style="font-size:10px;padding:2px 6px;border-radius:4px;background:rgba(59,130,246,.1);color:var(--blue);font-weight:600">📰 提及 ${s.score} 次</span>
+          ${fresh?`<span style="font-size:10px;padding:2px 6px;border-radius:4px;background:rgba(0,214,143,.1);color:var(--green);font-weight:600">🕐 ${fresh}</span>`:''}
         </div>
         <div class="np-news">${newsHtml}</div>
       </div>`}).join('')+'</div>';

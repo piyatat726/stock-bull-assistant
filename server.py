@@ -1019,10 +1019,14 @@ NEGATIVE_KW = ['跌','下跌','利空','看空','砍','下修','衰退','虧損'
 
 @app.route('/api/news_picks')
 def news_picks():
+    # Diverse queries surface more than just the daily mega-cap headlines
+    queries = ['台股 漲停 個股', '法人 買超 個股', '營收 創新高 個股',
+               '台股 強勢 飆股', '外資 買超 股票', '台股 利多 題材', '半導體 股票 漲']
     all_news = []
-    for q in ['台股 漲 股票','台股 看好','外資 買超 股票','台股 利多','半導體 股票 漲']:
+    for q in queries:
         all_news.extend(fetch_google_news(q, limit=12))
 
+    # Dedup by title
     seen_titles = set()
     unique_news = []
     for n in all_news:
@@ -1030,12 +1034,22 @@ def news_picks():
             seen_titles.add(n['title'])
             unique_news.append(n)
 
+    now = datetime.datetime.now(datetime.timezone.utc)
+    RECENT_HOURS = 96  # only news within last 4 days counts (drops weeks-old stale picks)
+
     picks = {}
     for n in unique_news:
         title = n['title']
         pos = sum(1 for kw in POSITIVE_KW if kw in title)
         neg = sum(1 for kw in NEGATIVE_KW if kw in title)
         if pos <= neg:
+            continue
+        # Recency gate: skip stale headlines entirely
+        ts = _parse_pubdate(n.get('date'))
+        if ts is None:
+            continue
+        age_h = (now - ts).total_seconds() / 3600
+        if age_h > RECENT_HOURS:
             continue
         # Find all company names in the title (skip 1-char names — too noisy)
         matched = [(name, code) for name, code in NAME_TO_CODE.items()
@@ -1046,8 +1060,11 @@ def news_picks():
                    if not any(nm != other and nm in other for other, _ in matched)]
         for name, code in matched:
             if code not in picks:
-                picks[code] = {'code': code, 'name': name, 'news': [], 'score': 0}
-            picks[code]['score'] += pos
+                picks[code] = {'code': code, 'name': name, 'news': [],
+                               'mentions': 0, 'kw': 0, 'fresh_h': age_h}
+            picks[code]['mentions'] += 1
+            picks[code]['kw'] += pos
+            picks[code]['fresh_h'] = min(picks[code]['fresh_h'], age_h)
             if len(picks[code]['news']) < 2:
                 picks[code]['news'].append({
                     'title': title, 'source': n['source'],
@@ -1066,20 +1083,31 @@ def news_picks():
     results = []
     for code, pk in picks.items():
         s = smap.get(code, {})
-        if not s:
+        if not s or not s.get('price'):
             continue
+        chg = s.get('change_pct', 0) or 0
+        # A "good-news pick" shouldn't be one that's actually crashing today
+        if chg < -3:
+            continue
+        fresh_h = pk['fresh_h']
+        # Blended score: positive-keyword strength + mention count + today's
+        # momentum, minus a freshness penalty (older news ranks lower)
+        hot = pk['kw'] * 2 + pk['mentions'] * 1.5 + chg * 0.6 - (fresh_h / 24)
         results.append({
             'code': code, 'name': pk['name'],
             'price': s.get('price', 0),
             'change': s.get('change', 0),
-            'change_pct': s.get('change_pct', 0),
+            'change_pct': chg,
             'volume': s.get('volume', '-'),
             'market': s.get('market', 'tse'),
-            'score': pk['score'],
+            'score': pk['mentions'],          # shown as 新聞提及 N 次
+            'hot': round(hot, 1),
+            'fresh_hours': round(fresh_h, 1),
             'news': pk['news'],
         })
 
-    results.sort(key=lambda x: x['score'], reverse=True)
+    # Rank by blended hotness (fresh + positive + rising), not raw keyword count
+    results.sort(key=lambda x: x['hot'], reverse=True)
     return jsonify(results[:8])
 
 @app.route('/api/news')
