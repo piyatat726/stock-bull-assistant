@@ -799,6 +799,10 @@ body *{transition:background-color var(--transition-speed) ease,border-color var
     <input class="inp" id="news-search" placeholder="搜尋股票新聞，例如：鴻海、生技" style="flex:1;max-width:300px" onkeypress="if(event.key==='Enter')searchNews()">
     <button class="btn" onclick="searchNews()">搜尋新聞</button>
   </div>
+  <div id="news-meta" style="display:flex;align-items:center;gap:8px;margin:4px 2px 8px;font-size:11px;color:var(--dim)">
+    <button class="hbtn" onclick="loadNews(currentNewsQuery)" style="font-size:11px;padding:4px 10px">🔄 重新整理</button>
+    <span id="news-updated"></span>
+  </div>
   <div id="news-list"><div class="loading"><span class="spin">↻</span> 載入新聞中...</div></div>
 </div>
 
@@ -887,6 +891,7 @@ document.querySelectorAll('.tab').forEach(t=>t.addEventListener('click',()=>{
   if(pg==='margin')loadMargin();
   if(pg==='backtest')$('bt-codes').focus();
   if(pg==='signals')loadSignals();
+  if(pg==='news')loadNews(currentNewsQuery);
   if(pg==='search'){$('s-popular').style.display='block';$('s-res').style.display='none';$('s-inp').focus()}
 }));
 
@@ -2468,7 +2473,6 @@ if(Notification.permission==='default')Notification.requestPermission();
 refreshAll();
 
 // News
-let newsLoaded=false;
 function timeAgo(dateStr){
   if(!dateStr)return '';
   try{
@@ -2482,7 +2486,10 @@ function timeAgo(dateStr){
     return d.toLocaleDateString('zh-TW');
   }catch(e){return dateStr}
 }
+let currentNewsQuery='台股';
+let newsReqSeq=0;
 async function loadNews(query='台股',btnEl){
+  currentNewsQuery=query||'台股';
   if(btnEl&&btnEl!=='this'){
     document.querySelectorAll('#news-tabs button').forEach(b=>b.classList.remove('active'));
     btnEl.classList.add('active');
@@ -2490,11 +2497,13 @@ async function loadNews(query='台股',btnEl){
     const caller=event&&event.target;
     if(caller){document.querySelectorAll('#news-tabs button').forEach(b=>b.classList.remove('active'));caller.classList.add('active')}
   }
+  const seq=++newsReqSeq;  // guard against out-of-order responses
   $('news-list').innerHTML='<div class="loading"><span class="spin">↻</span> 載入新聞中...</div>';
   try{
-    const r=await fetch('/api/news?q='+encodeURIComponent(query));
+    const r=await fetch('/api/news?q='+encodeURIComponent(currentNewsQuery));
     const data=await r.json();
-    if(!data.length){$('news-list').innerHTML='<div style="text-align:center;padding:40px;color:var(--dim)">暫無相關新聞</div>';return}
+    if(seq!==newsReqSeq)return;  // a newer request superseded this one
+    if(!data.length){$('news-list').innerHTML='<div style="text-align:center;padding:40px;color:var(--dim)">暫無相關新聞</div>';$('news-updated').textContent='';return}
     $('news-list').innerHTML=data.map(n=>`
       <a class="news-item" href="${n.link}" target="_blank" rel="noopener">
         <div class="nt">${n.title}</div>
@@ -2503,7 +2512,10 @@ async function loadNews(query='台股',btnEl){
           <span>${timeAgo(n.date)}</span>
         </div>
       </a>`).join('');
+    const now=new Date();
+    $('news-updated').textContent=`更新於 ${now.toLocaleTimeString('zh-TW',{hour:'2-digit',minute:'2-digit',second:'2-digit'})} · ${data.length} 則`;
   }catch(e){
+    if(seq!==newsReqSeq)return;
     $('news-list').innerHTML='<div style="text-align:center;padding:40px;color:var(--dim)">載入失敗，請稍後重試</div>';
   }
 }
@@ -2513,12 +2525,10 @@ function searchNews(){
   document.querySelectorAll('#news-tabs button').forEach(b=>b.classList.remove('active'));
   loadNews(q);
 }
-
-// Tab switch hook for lazy loading news
-const origTabClick=document.querySelectorAll('.nav .tab');
-origTabClick.forEach(t=>t.addEventListener('click',function(){
-  if(this.dataset.page==='news'&&!newsLoaded){newsLoaded=true;loadNews()}
-}));
+// Auto-refresh news every 90s while the news tab is open
+setInterval(()=>{
+  if($('page-news')&&$('page-news').classList.contains('active'))loadNews(currentNewsQuery);
+},90000);
 
 // Share
 let shareUrl='', localUrl='', tunnelUrl='';

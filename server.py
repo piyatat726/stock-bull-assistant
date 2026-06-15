@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import json, datetime, time, threading, requests, os, subprocess, re
+import urllib.parse, email.utils
+import xml.etree.ElementTree as ET
 from flask import Flask, jsonify, send_from_directory, request
 
 app = Flask(__name__, static_folder='static')
@@ -72,6 +74,80 @@ def cached_get(url, ttl=CACHE_TTL):
         return data
     except Exception:
         return cache.get(url, {}).get('data', {})
+
+# ── News fetching (robust Google News RSS) ──────────────────────────────
+# Junk-feed markers: when Google rate-limits, it returns a generic lifestyle
+# feed instead of the queried results. We detect & reject these.
+_NEWS_JUNK_KW = ['郊遊', '夜市', '湯圓', '炒麵', '臭豆腐', '劇集', '閨密', '星座', '食譜', '旅遊景點']
+# Low-value portal / homepage entries (no real headline) — drop these
+_NEWS_PORTAL_KW = ['基智網', 'FundDJ', 'Anue鉅亨網', 'Yahoo奇摩股市首頁']
+_news_cache = {}  # query -> {'items': [...], 't': ts}  (last KNOWN-GOOD results)
+
+def _parse_pubdate(s):
+    if not s:
+        return None
+    try:
+        return email.utils.parsedate_to_datetime(s)
+    except Exception:
+        return None
+
+def _looks_like_junk(items):
+    """Detect Google's generic fallback feed (returned when rate-limited)."""
+    if not items:
+        return True
+    junk = sum(1 for n in items if any(kw in n['title'] for kw in _NEWS_JUNK_KW))
+    return junk >= max(2, len(items) // 3)
+
+def fetch_google_news(query, limit=30, ttl=180, min_items=2):
+    """Fetch news from Google RSS: properly URL-encoded, newest-first, cached,
+    with a quality guard that serves last-good results if Google returns junk."""
+    now = time.time()
+    ck = query.strip()
+    cached = _news_cache.get(ck)
+    if cached and now - cached['t'] < ttl:
+        return cached['items'][:limit]
+
+    items = []
+    try:
+        q = urllib.parse.quote(query.strip())
+        url = f'https://news.google.com/rss/search?q={q}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant'
+        r = requests.get(url, headers=HEADERS, timeout=8)
+        root = ET.fromstring(r.content)
+        for item in root.findall('.//item'):
+            t = item.find('title')
+            l = item.find('link')
+            p = item.find('pubDate')
+            s = item.find('source')
+            if t is not None and t.text:
+                if any(kw in t.text for kw in _NEWS_PORTAL_KW):
+                    continue  # skip portal/homepage non-articles
+                items.append({
+                    'title': t.text,
+                    'link': l.text if l is not None else '',
+                    'date': p.text if p is not None else '',
+                    'source': s.text if s is not None else '',
+                    '_ts': _parse_pubdate(p.text if p is not None else ''),
+                })
+    except Exception:
+        items = []
+
+    # Reject junk / too-few results → serve last known-good cache instead
+    if _looks_like_junk(items) or len(items) < min_items:
+        if cached:
+            return cached['items'][:limit]
+        return [] if _looks_like_junk(items) else _finalize_news(items)[:limit]
+
+    items = _finalize_news(items)
+    _news_cache[ck] = {'items': items, 't': now}
+    return items[:limit]
+
+def _finalize_news(items):
+    """Sort newest-first and strip internal fields."""
+    _MIN = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+    items.sort(key=lambda x: x.get('_ts') or _MIN, reverse=True)
+    for it in items:
+        it.pop('_ts', None)
+    return items
 
 def load_watchlist():
     try:
@@ -943,27 +1019,9 @@ NEGATIVE_KW = ['跌','下跌','利空','看空','砍','下修','衰退','虧損'
 
 @app.route('/api/news_picks')
 def news_picks():
-    import xml.etree.ElementTree as ET
     all_news = []
     for q in ['台股 漲 股票','台股 看好','外資 買超 股票','台股 利多','半導體 股票 漲']:
-        try:
-            url = f'https://news.google.com/rss/search?q={q}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant'
-            r = requests.get(url, headers=HEADERS, timeout=8)
-            root = ET.fromstring(r.content)
-            for item in root.findall('.//item')[:12]:
-                t = item.find('title')
-                l = item.find('link')
-                p = item.find('pubDate')
-                s = item.find('source')
-                if t is not None and t.text:
-                    all_news.append({
-                        'title': t.text,
-                        'link': l.text if l is not None else '',
-                        'date': p.text if p is not None else '',
-                        'source': s.text if s is not None else '',
-                    })
-        except Exception:
-            continue
+        all_news.extend(fetch_google_news(q, limit=12))
 
     seen_titles = set()
     unique_news = []
@@ -979,16 +1037,22 @@ def news_picks():
         neg = sum(1 for kw in NEGATIVE_KW if kw in title)
         if pos <= neg:
             continue
-        for name, code in NAME_TO_CODE.items():
-            if name in title:
-                if code not in picks:
-                    picks[code] = {'code': code, 'name': name, 'news': [], 'score': 0}
-                picks[code]['score'] += pos
-                if len(picks[code]['news']) < 2:
-                    picks[code]['news'].append({
-                        'title': title, 'source': n['source'],
-                        'date': n['date'], 'link': n['link'],
-                    })
+        # Find all company names in the title (skip 1-char names — too noisy)
+        matched = [(name, code) for name, code in NAME_TO_CODE.items()
+                   if len(name) >= 2 and name in title]
+        # Drop names that are substrings of a longer matched name
+        # (e.g. "聯發" when "聯發科" also matched → keep only 聯發科)
+        matched = [(nm, cd) for nm, cd in matched
+                   if not any(nm != other and nm in other for other, _ in matched)]
+        for name, code in matched:
+            if code not in picks:
+                picks[code] = {'code': code, 'name': name, 'news': [], 'score': 0}
+            picks[code]['score'] += pos
+            if len(picks[code]['news']) < 2:
+                picks[code]['news'].append({
+                    'title': title, 'source': n['source'],
+                    'date': n['date'], 'link': n['link'],
+                })
 
     if not picks:
         return jsonify([])
@@ -1021,35 +1085,20 @@ def news_picks():
 @app.route('/api/news')
 def news():
     query = request.args.get('q', '台股').strip()
-    import xml.etree.ElementTree as ET
-    results = []
-    try:
-        url = f'https://news.google.com/rss/search?q={query}+股票&hl=zh-TW&gl=TW&ceid=TW:zh-Hant'
-        r = requests.get(url, headers=HEADERS, timeout=8)
-        root = ET.fromstring(r.content)
-        for item in root.findall('.//item')[:30]:
-            title = item.find('title')
-            link = item.find('link')
-            pub = item.find('pubDate')
-            src = item.find('source')
-            if title is not None and title.text:
-                results.append({
-                    'title': title.text,
-                    'link': link.text if link is not None else '',
-                    'date': pub.text if pub is not None else '',
-                    'source': src.text if src is not None else '',
-                })
-    except Exception:
-        pass
+    # Build a smart query: append 股票 only for short index/sector keywords
+    q = query if any(c.isdigit() for c in query) else f'{query} 股票'
+    results = fetch_google_news(q, limit=30)
+    # Fallback to cnyes only if Google totally failed
     if not results:
         try:
-            url2 = f'https://api.cnyes.com/media/api/v1/newslist/category/tw_stock?limit=30'
+            url2 = 'https://api.cnyes.com/media/api/v1/newslist/category/tw_stock?limit=30'
             data = cached_get(url2, ttl=300)
             for item in data.get('items', {}).get('data', [])[:30]:
+                ts = item.get('publishAt', 0)
                 results.append({
                     'title': item.get('title', ''),
                     'link': f'https://news.cnyes.com/news/id/{item.get("newsId","")}',
-                    'date': datetime.datetime.fromtimestamp(item.get('publishAt', 0)).strftime('%Y-%m-%d %H:%M') if item.get('publishAt') else '',
+                    'date': email.utils.formatdate(ts, localtime=False) if ts else '',
                     'source': '鉅亨網',
                 })
         except Exception:
@@ -2423,34 +2472,17 @@ def stock_news():
     if not code:
         return jsonify([])
     name = STOCK_NAMES.get(code, _name_cache.get(code, code))
-    import xml.etree.ElementTree as ET
     results = []
-    for q in [name, f'{code} 股票']:
-        try:
-            url = f'https://news.google.com/rss/search?q={q}+台股&hl=zh-TW&gl=TW&ceid=TW:zh-Hant'
-            r = requests.get(url, headers=HEADERS, timeout=8)
-            root = ET.fromstring(r.content)
-            for item in root.findall('.//item')[:8]:
-                t = item.find('title')
-                l = item.find('link')
-                p = item.find('pubDate')
-                s = item.find('source')
-                if t is not None and t.text:
-                    results.append({
-                        'title': t.text,
-                        'link': l.text if l is not None else '',
-                        'date': p.text if p is not None else '',
-                        'source': s.text if s is not None else '',
-                    })
-        except Exception:
-            continue
-    # Deduplicate
+    for q in [f'{name} 股票', f'{code} 台股']:
+        results.extend(fetch_google_news(q, limit=8))
+    # Deduplicate by title, then sort newest-first
     seen = set()
     unique = []
     for n in results:
         if n['title'] not in seen:
             seen.add(n['title'])
             unique.append(n)
+    unique = _finalize_news([{**n, '_ts': _parse_pubdate(n.get('date'))} for n in unique])
     return jsonify(unique[:6])
 
 @app.route('/api/entry_signals')
@@ -3654,23 +3686,20 @@ def stock_signal():
     # ═══════════════════════════════════════════
     news = []
     try:
-        import xml.etree.ElementTree as ET
         stock_name = name or code
-        for q in [stock_name, f'{code} 股票']:
-            nurl = f'https://news.google.com/rss/search?q={q}+台股&hl=zh-TW&gl=TW&ceid=TW:zh-Hant'
-            nr = requests.get(nurl, headers=HEADERS, timeout=5)
-            root = ET.fromstring(nr.content)
-            for item in root.findall('.//item')[:5]:
-                t = item.find('title')
-                src = item.find('source')
-                pd = item.find('pubDate')
-                if t is not None and t.text:
-                    news.append({'title': t.text, 'source': src.text if src is not None else '',
-                                 'date': pd.text[:16] if pd is not None else ''})
-            if news:
+        raw = []
+        for q in [f'{stock_name} 台股', f'{code} 股票']:
+            raw.extend(fetch_google_news(q, limit=5))
+            if raw:
                 break
         seen_titles = set()
-        news = [n for n in news if n['title'] not in seen_titles and not seen_titles.add(n['title'])][:4]
+        for n in raw:
+            if n['title'] in seen_titles:
+                continue
+            seen_titles.add(n['title'])
+            news.append({'title': n['title'], 'source': n.get('source', ''),
+                         'date': n.get('date', '')[:16]})
+        news = news[:4]
     except Exception:
         pass
 
