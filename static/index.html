@@ -786,14 +786,14 @@ body *{transition:background-color var(--transition-speed) ease,border-color var
 <div class="page" id="page-news">
   <div class="stitle">📰 台股即時新聞</div>
   <div class="news-tabs" id="news-tabs">
-    <button class="active" onclick="loadNews('台股','this')">📊 大盤</button>
-    <button onclick="loadNews('台積電','this')">台積電</button>
-    <button onclick="loadNews('聯發科','this')">聯發科</button>
-    <button onclick="loadNews('金融股','this')">金融股</button>
-    <button onclick="loadNews('半導體','this')">半導體</button>
-    <button onclick="loadNews('AI概念股','this')">AI</button>
-    <button onclick="loadNews('航運股','this')">航運</button>
-    <button onclick="loadNews('ETF','this')">ETF</button>
+    <button class="active" onclick="loadNews('台股',this)">📊 大盤</button>
+    <button onclick="loadNews('台積電',this)">台積電</button>
+    <button onclick="loadNews('聯發科',this)">聯發科</button>
+    <button onclick="loadNews('金融股',this)">金融股</button>
+    <button onclick="loadNews('半導體',this)">半導體</button>
+    <button onclick="loadNews('AI概念股',this)">AI</button>
+    <button onclick="loadNews('航運股',this)">航運</button>
+    <button onclick="loadNews('ETF',this)">ETF</button>
   </div>
   <div class="addbar">
     <input class="inp" id="news-search" placeholder="搜尋股票新聞，例如：鴻海、生技" style="flex:1;max-width:300px" onkeypress="if(event.key==='Enter')searchNews()">
@@ -850,7 +850,7 @@ function updateTime(){
   else{ms.textContent='已收盤';ms.className='market-status closed';refreshInterval=120}
 }
 setInterval(updateTime,1000);updateTime();
-setInterval(()=>{countdown--;if(countdown<=0){countdown=refreshInterval;refreshAll()}$('update-timer').textContent=countdown+'s'},1000);
+setInterval(()=>{countdown--;if(countdown<=0){countdown=refreshInterval;if($('page-overview').classList.contains('active'))refreshAll();else $('refresh-btn').classList.remove('spin')}$('update-timer').textContent=countdown+'s'},1000);
 
 // Toast
 function toast(msg,type='info'){
@@ -878,6 +878,7 @@ document.querySelectorAll('.tab').forEach(t=>t.addEventListener('click',()=>{
   t.classList.add('active');
   $('page-'+t.dataset.page).classList.add('active');
   const pg=t.dataset.page;
+  if(pg==='overview')refreshAll();
   if(pg==='chart')loadChart(); else stopChartUpdate();
   if(pg==='etf')loadETF();
   if(pg==='institutional')loadInst();
@@ -962,7 +963,6 @@ async function loadWL(){
         <div class="det"><span class="dl">量</span><span>${fm(s.volume)}</span></div>
       </div></div>`}).join('');
     updateChSel();
-    checkAlerts(stocks);
   }catch(e){$('wl-grid').innerHTML='<div class="loading">載入失敗</div>'}
 }
 
@@ -996,7 +996,8 @@ async function loadMovers(){
 async function loadVolRank(){
   try{
     const r=await fetch('/api/volume_rank');const data=await r.json();
-    const maxV=Math.max(...data.map(s=>parseInt(s.volume)||0));
+    if(!data.length){$('vol-rank').innerHTML='<div style="color:var(--dim);padding:16px;text-align:center;font-size:12px">暫無成交量資料</div>';return}
+    const maxV=Math.max(...data.map(s=>parseInt(s.volume)||0),1);
     $('vol-rank').innerHTML=data.map((s,i)=>{
       const w=Math.round((parseInt(s.volume)/maxV)*100);
       const c=cc(s.change);
@@ -1195,38 +1196,7 @@ function renderPF(){
 }
 function upP(code,field,val){const d=getP();if(!d[code])d[code]={};d[code][field]=val;setP(d);renderPF()}
 
-// Alerts
-function getA(){return JSON.parse(localStorage.getItem('alerts')||'[]')}
-function setA(a){localStorage.setItem('alerts',JSON.stringify(a))}
-function addAlert(){
-  const code=$('a-code').value.trim(),dir=$('a-dir').value,price=parseFloat($('a-price').value);
-  if(!code||!price){toast('請填入代碼和目標價','error');return}
-  const a=getA();a.push({code,direction:dir,price,triggered:false});setA(a);
-  $('a-code').value='';$('a-price').value='';
-  toast(`已設定提醒：${code} ${dir==='above'?'≥':'≤'} ${price}`,'success');
-  renderAlerts();
-  if(Notification.permission==='default')Notification.requestPermission();
-}
-function delAlert(i){const a=getA();a.splice(i,1);setA(a);renderAlerts()}
-function renderAlerts(){
-  const a=getA();
-  $('a-list').innerHTML=!a.length?'<div style="color:var(--dim);padding:30px;text-align:center">尚未設定提醒<br><span style="font-size:11px">在上方輸入股票代碼和目標價開始</span></div>':
-    a.map((x,i)=>`<div class="alert-item"><div>
-      <strong>${x.code}</strong> ${x.direction==='above'?'漲到 ≥':'跌到 ≤'} <strong style="color:var(--gold)">${x.price}</strong>
-      ${x.triggered?'<span style="color:var(--green);font-size:11px;margin-left:6px">✅ 已觸發</span>':'<span style="color:var(--dim);font-size:11px;margin-left:6px">⏳ 等待中</span>'}
-    </div><button class="alert-del" onclick="delAlert(${i})">✕</button></div>`).join('');
-}
-function checkAlerts(stocks){
-  const a=getA();let changed=false;
-  a.forEach(x=>{if(x.triggered)return;
-    const s=stocks.find(s=>s.code===x.code);if(!s)return;
-    const hit=(x.direction==='above'&&s.price>=x.price)||(x.direction==='below'&&s.price<=x.price);
-    if(hit){x.triggered=true;changed=true;
-      toast(`${s.name}(${s.code}) 現價 ${s.price}，已${x.direction==='above'?'漲到':'跌到'}目標 ${x.price}！`,'success');
-      if(Notification.permission==='granted')new Notification('🐂 台股小牛提醒',{body:`${s.name}(${s.code}) 現價 ${s.price}，已達目標價 ${x.price}！`});
-    }});
-  if(changed)setA(a);
-}
+// (Price-alert subsystem lives further below — see priceAlerts / checkPriceAlerts)
 
 // Chart (TradingView Lightweight Charts)
 function updateChSel(){
@@ -1901,7 +1871,7 @@ async function calcDCA(){
     const d=await r.json();
     if(d.error){el.innerHTML=`<div style="color:var(--red);padding:12px">${d.error==='no data'?'找不到該股票的歷史資料':'資料不足'}</div>`;return}
     const profitC=d.profit>=0?'var(--red)':'var(--green)';
-    const profitBg=d.profit>=0?'rgba(16,185,129,.06)':'rgba(255,77,106,.06)';
+    const profitBg=d.profit>=0?'rgba(255,77,106,.06)':'rgba(16,185,129,.06)';
     el.innerHTML=`
       <div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px;margin-bottom:12px">
         <div style="font-size:15px;font-weight:700;margin-bottom:12px">${d.name}(${d.code}) 定期定額 ${d.months} 個月</div>
@@ -2418,7 +2388,7 @@ async function loadDailySummary(){
 }
 
 // ── Price Alert Push (到價提醒) ──
-let priceAlerts=JSON.parse(localStorage.getItem('priceAlerts')||'[]');
+let priceAlerts=(()=>{try{return JSON.parse(localStorage.getItem('priceAlerts')||'[]')}catch(e){return[]}})();
 function addAlert(){
   const code=$('a-code').value.trim();
   const dir=$('a-dir').value;
@@ -2492,12 +2462,10 @@ let currentNewsQuery='台股';
 let newsReqSeq=0;
 async function loadNews(query='台股',btnEl){
   currentNewsQuery=query||'台股';
-  if(btnEl&&btnEl!=='this'){
+  // btnEl is the clicked element (or undefined for programmatic/refresh calls)
+  if(btnEl&&btnEl.classList){
     document.querySelectorAll('#news-tabs button').forEach(b=>b.classList.remove('active'));
     btnEl.classList.add('active');
-  }else if(btnEl==='this'){
-    const caller=event&&event.target;
-    if(caller){document.querySelectorAll('#news-tabs button').forEach(b=>b.classList.remove('active'));caller.classList.add('active')}
   }
   const seq=++newsReqSeq;  // guard against out-of-order responses
   $('news-list').innerHTML='<div class="loading"><span class="spin">↻</span> 載入新聞中...</div>';

@@ -165,16 +165,20 @@ def parse_stock(item):
     try:
         yesterday = float(item.get('y', '0')) if item.get('y', '-') != '-' else 0
         z_val = item.get('z', '-')
-        if z_val and z_val != '-':
+        traded = bool(z_val and z_val != '-')
+        if traded:
             current = float(z_val)
+            change = current - yesterday
+            change_pct = (change / yesterday * 100) if yesterday else 0
         else:
-            # During lunch break / pre-market, z is '-'. Use best bid as fallback.
+            # No real trade tick yet (pre-market / post-close). Show previous
+            # close flat — never fabricate a gain/loss from the bid quote.
             bid_str = item.get('b', '').split('_')[0]
-            current = float(bid_str) if bid_str and bid_str != '-' else yesterday
+            current = float(bid_str) if (bid_str and bid_str != '-' and yesterday == 0) else yesterday
+            change = 0
+            change_pct = 0
         if current == 0 and yesterday == 0:
             return None
-        change = current - yesterday
-        change_pct = (change / yesterday * 100) if yesterday else 0
         buy_prices = [float(p) for p in item.get('b', '').split('_') if p and p != '-']
         sell_prices = [float(p) for p in item.get('a', '').split('_') if p and p != '-']
         op = item.get('o', '-')
@@ -670,91 +674,8 @@ def historical():
     if not code:
         return jsonify([])
 
-    all_data = []
-    today = datetime.date.today()
-
-    for m in range(months):
-        d = today.replace(day=1) - datetime.timedelta(days=m * 28)
-        try:
-            if market == 'tse':
-                date_str = d.strftime('%Y%m01')
-                url = f'https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&date={date_str}&stockNo={code}'
-                data = cached_get(url, ttl=3600)
-                for row in data.get('data', []):
-                    parts = row[0].split('/')
-                    y = int(parts[0]) + 1911
-                    all_data.append({
-                        'date': f'{y}-{parts[1]}-{parts[2]}',
-                        'open': float(row[3].replace(',', '')),
-                        'high': float(row[4].replace(',', '')),
-                        'low': float(row[5].replace(',', '')),
-                        'close': float(row[6].replace(',', '')),
-                        'volume': int(row[1].replace(',', '')),
-                    })
-            else:
-                roc_year = d.year - 1911
-                roc_date = f'{roc_year}/{d.month:02d}'
-                url = f'https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={roc_date}&stkno={code}'
-                data = cached_get(url, ttl=3600)
-                for row in data.get('aaData', []):
-                    parts = row[0].split('/')
-                    y = int(parts[0]) + 1911
-                    all_data.append({
-                        'date': f'{y}-{parts[1]}-{parts[2]}',
-                        'open': float(str(row[3]).replace(',', '')),
-                        'high': float(str(row[4]).replace(',', '')),
-                        'low': float(str(row[5]).replace(',', '')),
-                        'close': float(str(row[6]).replace(',', '')),
-                        'volume': int(str(row[1]).replace(',', '')),
-                    })
-        except Exception:
-            continue
-
-    # Yahoo Finance fallback for historical data
-    if not all_data:
-        suffixes = [('.TW' if market == 'tse' else '.TWO')]
-        suffixes.append('.TWO' if suffixes[0] == '.TW' else '.TW')  # try opposite market too
-        for suffix in suffixes:
-            try:
-                period = f'{months}mo' if months <= 6 else '1y'
-                url = f'https://query1.finance.yahoo.com/v8/finance/chart/{code}{suffix}?interval=1d&range={period}'
-                d = cached_get(url, ttl=3600)
-                chart_result = d.get('chart', {}).get('result')
-                if not chart_result:
-                    continue
-                result = chart_result[0]
-                timestamps = result.get('timestamp', [])
-                quotes = result.get('indicators', {}).get('quote', [{}])[0]
-                for i, ts in enumerate(timestamps):
-                    try:
-                        dt = datetime.datetime.fromtimestamp(ts)
-                        o = quotes.get('open', [])[i]
-                        h = quotes.get('high', [])[i]
-                        l = quotes.get('low', [])[i]
-                        c = quotes.get('close', [])[i]
-                        v = quotes.get('volume', [])[i]
-                        if o and h and l and c:
-                            all_data.append({
-                                'date': dt.strftime('%Y-%m-%d'),
-                                'open': round(float(o), 2), 'high': round(float(h), 2),
-                                'low': round(float(l), 2), 'close': round(float(c), 2),
-                                'volume': int(v) if v else 0,
-                            })
-                    except (IndexError, TypeError):
-                        continue
-                if all_data:
-                    break  # found data, no need to try other suffix
-            except Exception:
-                continue
-
-    all_data.sort(key=lambda x: x['date'])
-    seen = set()
-    unique = []
-    for d in all_data:
-        if d['date'] not in seen:
-            seen.add(d['date'])
-            unique.append(d)
-    return jsonify(unique)
+    # Unified fetcher handles TSE (STOCK_DAY) + OTC (Yahoo) + fallback, sorted & deduped
+    return jsonify(fetch_daily_history(code, market, months=max(months, 1)))
 
 @app.route('/api/institutional')
 def institutional():
@@ -824,11 +745,99 @@ def dividend():
     except Exception:
         return jsonify([])
 
+def _safe_int(v, default=0):
+    """Parse possibly-comma-formatted volume strings without crashing."""
+    try:
+        return int(str(v).replace(',', '').split('.')[0])
+    except (ValueError, TypeError):
+        return default
+
+def fetch_daily_history(code, market, months=6):
+    """Unified daily OHLCV history fetcher.
+
+    TSE → TWSE STOCK_DAY (monthly). OTC → Yahoo directly, because the legacy
+    TPEX `st43_result.php` endpoint is DEAD (returns a 404 HTML page). Yahoo is
+    also the universal fallback when TWSE comes up short. Returns a sorted,
+    deduped list of {date, open, high, low, close, volume}. Volume in shares.
+    """
+    records = []
+    today = datetime.date.today()
+    if market == 'tse':
+        for m in range(months):
+            d = today.replace(day=1) - datetime.timedelta(days=m * 28)
+            url = f'https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&date={d.strftime("%Y%m01")}&stockNo={code}'
+            try:
+                data = cached_get(url, ttl=3600)
+                for row in data.get('data', []):
+                    try:
+                        parts = row[0].split('/')
+                        y = int(parts[0]) + 1911
+                        dt = f'{y}-{int(parts[1]):02d}-{int(parts[2]):02d}'
+                        records.append({
+                            'date': dt,
+                            'open': float(row[3].replace(',', '')),
+                            'high': float(row[4].replace(',', '')),
+                            'low': float(row[5].replace(',', '')),
+                            'close': float(row[6].replace(',', '')),
+                            'volume': _safe_int(row[1]),
+                        })
+                    except (ValueError, IndexError):
+                        continue
+            except Exception:
+                continue
+    # OTC primary source, or universal fallback when TWSE returned too little
+    if market != 'tse' or len(records) < 20:
+        rng = ('6mo' if months <= 6 else '1y' if months <= 12 else
+               '2y' if months <= 24 else '5y' if months <= 60 else '10y')
+        order = ['.TWO', '.TW'] if market != 'tse' else ['.TW', '.TWO']
+        for suffix in order:
+            try:
+                url = f'https://query1.finance.yahoo.com/v8/finance/chart/{code}{suffix}?interval=1d&range={rng}'
+                d = cached_get(url, ttl=3600)
+                cr = d.get('chart', {}).get('result')
+                if not cr:
+                    continue
+                ts = cr[0].get('timestamp', [])
+                q = cr[0].get('indicators', {}).get('quote', [{}])[0]
+                ya = []
+                for i, t in enumerate(ts):
+                    try:
+                        c = q.get('close', [])[i]
+                        if c is None:
+                            continue
+                        o = q.get('open', [])[i] or c
+                        h = q.get('high', [])[i] or c
+                        lo = q.get('low', [])[i] or c
+                        v = q.get('volume', [])[i]
+                        ya.append({
+                            'date': datetime.datetime.fromtimestamp(t).strftime('%Y-%m-%d'),
+                            'open': round(float(o), 2), 'high': round(float(h), 2),
+                            'low': round(float(lo), 2), 'close': round(float(c), 2),
+                            'volume': int(v) if v else 0,
+                        })
+                    except (IndexError, TypeError):
+                        continue
+                if len(ya) >= 20:
+                    if market != 'tse' or len(records) < 20:
+                        records = ya
+                    break
+            except Exception:
+                continue
+    # dedup + sort ascending by date
+    seen = set()
+    uniq = []
+    for r in sorted(records, key=lambda x: x['date']):
+        if r['date'] not in seen:
+            seen.add(r['date'])
+            uniq.append(r)
+    return uniq
+
 @app.route('/api/volume_rank')
 def volume_rank():
     pairs = [(c, 'tse') for c in POPULAR_TSE] + [(c, 'otc') for c in POPULAR_OTC]
     results = fetch_stocks(pairs)
-    ranked = sorted([r for r in results if r['volume'] != '-'], key=lambda x: int(x['volume']), reverse=True)[:10]
+    ranked = sorted([r for r in results if r['volume'] != '-'],
+                    key=lambda x: _safe_int(x['volume']), reverse=True)[:10]
     return jsonify(ranked)
 
 @app.route('/api/etf')
@@ -889,26 +898,8 @@ def momentum():
         score = 0
         try:
             code, market = s['code'], s['market']
-            today = datetime.date.today()
-            d = today.replace(day=1)
-            if market == 'tse':
-                date_str = d.strftime('%Y%m01')
-                url = f'https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&date={date_str}&stockNo={code}'
-            else:
-                roc_year = d.year - 1911
-                roc_date = f'{roc_year}/{d.month:02d}'
-                url = f'https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={roc_date}&stkno={code}'
-
-            data = cached_get(url, ttl=3600)
-            closes = []
-            rows = data.get('data', []) if market == 'tse' else data.get('aaData', [])
-            for row in rows:
-                try:
-                    c = float(str(row[6]).replace(',', '')) if market == 'tse' else float(str(row[6]).replace(',', ''))
-                    closes.append(c)
-                except (ValueError, IndexError):
-                    continue
-
+            hist = fetch_daily_history(code, market, months=2)
+            closes = [r['close'] for r in hist]
             if len(closes) < 5:
                 continue
 
@@ -924,7 +915,7 @@ def momentum():
                 score += 1
             if s['change_pct'] > 2:
                 score += 1
-            vol = int(s['volume']) if s['volume'] != '-' else 0
+            vol = _safe_int(s['volume']) if s['volume'] != '-' else 0
             if vol > 5000:
                 score += 1
 
@@ -1804,43 +1795,10 @@ def dca_calc():
     if code in [c for c in POPULAR_OTC]:
         market = 'otc'
 
-    # Fetch enough historical data
-    all_data = []
-    today = datetime.date.today()
-    for m in range(total_months + 2):
-        d = today.replace(day=1) - datetime.timedelta(days=m * 28)
-        if market == 'tse':
-            date_str = d.strftime('%Y%m01')
-            url = f'https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&date={date_str}&stockNo={code}'
-        else:
-            roc_year = d.year - 1911
-            roc_date = f'{roc_year}/{d.month:02d}'
-            url = f'https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={roc_date}&stkno={code}'
-        try:
-            data = cached_get(url, ttl=86400)
-            rows = data.get('data', []) if market == 'tse' else data.get('aaData', [])
-            for row in rows:
-                try:
-                    if market == 'tse':
-                        parts = row[0].split('/')
-                        y = int(parts[0]) + 1911
-                        date_key = f'{y}-{parts[1]}-{parts[2]}'
-                        close = float(str(row[6]).replace(',', ''))
-                    else:
-                        parts = row[0].split('/')
-                        y = int(parts[0]) + 1911
-                        date_key = f'{y}-{parts[1].zfill(2)}-{parts[2].zfill(2)}'
-                        close = float(str(row[6]).replace(',', ''))
-                    all_data.append({'date': date_key, 'close': close})
-                except (ValueError, IndexError):
-                    continue
-        except Exception:
-            continue
-
+    # Fetch enough historical data (unified fetcher: TSE + OTC + Yahoo fallback)
+    all_data = fetch_daily_history(code, market, months=total_months + 2)
     if not all_data:
         return jsonify({'error': 'no data', 'records': []})
-
-    all_data.sort(key=lambda x: x['date'])
 
     # Group by month, take first trading day of each month
     monthly_prices = {}
@@ -2071,82 +2029,8 @@ def backtest():
     results = []
     for code in codes:
         market = 'otc' if code in POPULAR_OTC else 'tse'
-        all_data = []
-        today = datetime.date.today()
-        for m in range(months + 1):
-            d = today.replace(day=1) - datetime.timedelta(days=m * 28)
-            try:
-                if market == 'tse':
-                    date_str = d.strftime('%Y%m01')
-                    url = f'https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&date={date_str}&stockNo={code}'
-                    data = cached_get(url, ttl=3600)
-                    for row in data.get('data', []):
-                        parts = row[0].split('/')
-                        y = int(parts[0]) + 1911
-                        try:
-                            all_data.append({
-                                'date': f'{y}-{parts[1]}-{parts[2]}',
-                                'close': float(row[6].replace(',', '')),
-                            })
-                        except (ValueError, IndexError):
-                            continue
-                else:
-                    roc_year = d.year - 1911
-                    roc_date = f'{roc_year}/{d.month:02d}'
-                    url = f'https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={roc_date}&stkno={code}'
-                    data = cached_get(url, ttl=3600)
-                    for row in data.get('aaData', []):
-                        parts = row[0].split('/')
-                        y = int(parts[0]) + 1911
-                        try:
-                            all_data.append({
-                                'date': f'{y}-{parts[1].zfill(2)}-{parts[2].zfill(2)}',
-                                'close': float(str(row[6]).replace(',', '')),
-                            })
-                        except (ValueError, IndexError):
-                            continue
-            except Exception:
-                continue
-
-        # Yahoo Finance fallback
-        if not all_data:
-            for suffix in ['.TW', '.TWO']:
-                try:
-                    period = f'{months}mo' if months <= 6 else '1y'
-                    url = f'https://query1.finance.yahoo.com/v8/finance/chart/{code}{suffix}?interval=1d&range={period}'
-                    d = cached_get(url, ttl=3600)
-                    chart_result = d.get('chart', {}).get('result')
-                    if not chart_result:
-                        continue
-                    result = chart_result[0]
-                    timestamps = result.get('timestamp', [])
-                    quotes = result.get('indicators', {}).get('quote', [{}])[0]
-                    for i, ts in enumerate(timestamps):
-                        try:
-                            dt = datetime.datetime.fromtimestamp(ts)
-                            c = quotes.get('close', [])[i]
-                            if c:
-                                all_data.append({'date': dt.strftime('%Y-%m-%d'), 'close': round(float(c), 2)})
-                        except (IndexError, TypeError):
-                            continue
-                    if all_data:
-                        break
-                except Exception:
-                    continue
-
-        if not all_data:
-            continue
-
-        all_data.sort(key=lambda x: x['date'])
-        # Remove duplicates
-        seen = set()
-        unique = []
-        for d in all_data:
-            if d['date'] not in seen:
-                seen.add(d['date'])
-                unique.append(d)
-        all_data = unique
-
+        # Unified fetcher: TSE + OTC + Yahoo fallback, sorted & deduped
+        all_data = fetch_daily_history(code, market, months=months + 1)
         if len(all_data) < 2:
             continue
 
@@ -2519,53 +2403,8 @@ def entry_signals():
     import math
 
     def _fetch_hist(code, market, months=6):
-        """Fetch historical close/high/low/volume data"""
-        records = []
-        today = datetime.date.today()
-        for m in range(months):
-            d = today.replace(day=1) - datetime.timedelta(days=m * 28)
-            try:
-                if market == 'tse':
-                    url = f'https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&date={d.strftime("%Y%m01")}&stockNo={code}'
-                else:
-                    roc_y = d.year - 1911
-                    url = f'https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={roc_y}/{d.month:02d}/01&stkno={code}&_=1'
-                data = cached_get(url, ttl=3600)
-                rows = data.get('data', []) if market == 'tse' else data.get('aaData', [])
-                for row in rows:
-                    try:
-                        if market == 'tse':
-                            parts = row[0].split('/')
-                            y = int(parts[0]) + 1911
-                            dt = f'{y}-{int(parts[1]):02d}-{int(parts[2]):02d}'
-                            c = float(row[6].replace(',', ''))
-                            h = float(row[4].replace(',', ''))
-                            lo = float(row[5].replace(',', ''))
-                            v = int(row[1].replace(',', ''))
-                            op = float(row[3].replace(',', ''))
-                        else:
-                            parts = str(row[0]).split('/')
-                            y = int(parts[0]) + 1911
-                            dt = f'{y}-{int(parts[1]):02d}-{int(parts[2]):02d}'
-                            c = float(str(row[6]).replace(',', ''))
-                            h = float(str(row[4]).replace(',', ''))
-                            lo = float(str(row[5]).replace(',', ''))
-                            v = int(str(row[1]).replace(',', ''))
-                            op = float(str(row[3]).replace(',', ''))
-                        records.append({'date': dt, 'close': c, 'high': h, 'low': lo, 'volume': v, 'open': op})
-                    except (ValueError, IndexError):
-                        continue
-            except Exception:
-                continue
-        records.sort(key=lambda x: x['date'])
-        # Deduplicate
-        seen = set()
-        unique = []
-        for r in records:
-            if r['date'] not in seen:
-                seen.add(r['date'])
-                unique.append(r)
-        return unique
+        """Fetch historical OHLCV (delegates to unified fetcher: TSE + OTC + Yahoo)"""
+        return fetch_daily_history(code, market, months=months)
 
     def calc_rsi(closes, period=14):
         if len(closes) < period + 1:
@@ -2940,65 +2779,8 @@ def portfolio_signals():
         return round(k_list[-1], 1), round(d_val, 1)
 
     def _fetch_hist_pf(code, market):
-        records = []
-        today = datetime.date.today()
-        for m in range(5):
-            d = today.replace(day=1) - datetime.timedelta(days=m * 28)
-            try:
-                if market == 'tse':
-                    url = f'https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&date={d.strftime("%Y%m01")}&stockNo={code}'
-                else:
-                    roc_y = d.year - 1911
-                    url = f'https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={roc_y}/{d.month:02d}/01&stkno={code}&_=1'
-                data = cached_get(url, ttl=3600)
-                rows = data.get('data', []) if market == 'tse' else data.get('aaData', [])
-                for row in rows:
-                    try:
-                        parts = str(row[0]).split('/')
-                        y = int(parts[0]) + 1911
-                        dt = f'{y}-{int(parts[1]):02d}-{int(parts[2]):02d}'
-                        records.append({'date': dt,
-                                        'close': float(str(row[6]).replace(',', '')),
-                                        'high': float(str(row[4]).replace(',', '')),
-                                        'low': float(str(row[5]).replace(',', '')),
-                                        'volume': int(str(row[1]).replace(',', ''))})
-                    except (ValueError, IndexError):
-                        continue
-            except Exception:
-                continue
-        # Yahoo fallback if TWSE failed
-        if len(records) < 20:
-            for suffix in [('.TW' if market == 'tse' else '.TWO'), ('.TWO' if market == 'tse' else '.TW')]:
-                try:
-                    url = f'https://query1.finance.yahoo.com/v8/finance/chart/{code}{suffix}?interval=1d&range=6mo'
-                    d = cached_get(url, ttl=3600)
-                    cr = d.get('chart', {}).get('result')
-                    if not cr:
-                        continue
-                    ts_list = cr[0].get('timestamp', [])
-                    q = cr[0].get('indicators', {}).get('quote', [{}])[0]
-                    for i, ts in enumerate(ts_list):
-                        try:
-                            h, lo, c = q.get('high', [])[i], q.get('low', [])[i], q.get('close', [])[i]
-                            v = q.get('volume', [])[i]
-                            if h and lo and c:
-                                records.append({'date': datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d'),
-                                                'close': round(float(c), 2), 'high': round(float(h), 2),
-                                                'low': round(float(lo), 2), 'volume': int(v) if v else 0})
-                        except (IndexError, TypeError):
-                            continue
-                    if len(records) >= 20:
-                        break
-                except Exception:
-                    continue
-        records.sort(key=lambda x: x['date'])
-        seen = set()
-        unique = []
-        for r in records:
-            if r['date'] not in seen:
-                seen.add(r['date'])
-                unique.append(r)
-        return unique
+        """Fetch historical OHLCV (delegates to unified fetcher: TSE + OTC + Yahoo)"""
+        return fetch_daily_history(code, market, months=5)
 
     def analyze(pair):
         code, market = pair
@@ -3172,51 +2954,8 @@ def stock_signal():
     market = 'otc' if code in POPULAR_OTC else 'tse'
     # Try to fetch — if tse fails, try otc
     def _fetch_hist_single(code, market, months=6):
-        records = []
-        today = datetime.date.today()
-        for m in range(months):
-            d = today.replace(day=1) - datetime.timedelta(days=m * 28)
-            try:
-                if market == 'tse':
-                    url = f'https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&date={d.strftime("%Y%m01")}&stockNo={code}'
-                else:
-                    roc_y = d.year - 1911
-                    url = f'https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={roc_y}/{d.month:02d}/01&stkno={code}&_=1'
-                data = cached_get(url, ttl=3600)
-                rows = data.get('data', []) if market == 'tse' else data.get('aaData', [])
-                for row in rows:
-                    try:
-                        if market == 'tse':
-                            parts = row[0].split('/')
-                            y = int(parts[0]) + 1911
-                            dt = f'{y}-{int(parts[1]):02d}-{int(parts[2]):02d}'
-                            c = float(row[6].replace(',', ''))
-                            h = float(row[4].replace(',', ''))
-                            lo = float(row[5].replace(',', ''))
-                            v = int(row[1].replace(',', ''))
-                            op = float(row[3].replace(',', ''))
-                        else:
-                            parts = str(row[0]).split('/')
-                            y = int(parts[0]) + 1911
-                            dt = f'{y}-{int(parts[1]):02d}-{int(parts[2]):02d}'
-                            c = float(str(row[6]).replace(',', ''))
-                            h = float(str(row[4]).replace(',', ''))
-                            lo = float(str(row[5]).replace(',', ''))
-                            v = int(str(row[1]).replace(',', ''))
-                            op = float(str(row[3]).replace(',', ''))
-                        records.append({'date': dt, 'close': c, 'high': h, 'low': lo, 'volume': v, 'open': op})
-                    except (ValueError, IndexError):
-                        continue
-            except Exception:
-                continue
-        records.sort(key=lambda x: x['date'])
-        seen = set()
-        unique = []
-        for r in records:
-            if r['date'] not in seen:
-                seen.add(r['date'])
-                unique.append(r)
-        return unique
+        """Fetch historical OHLCV (delegates to unified fetcher: TSE + OTC + Yahoo)"""
+        return fetch_daily_history(code, market, months=months)
 
     # Helper functions (same as entry_signals)
     def calc_rsi(closes, period=14):
