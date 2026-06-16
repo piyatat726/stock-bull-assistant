@@ -489,6 +489,10 @@ body *{transition:background-color var(--transition-speed) ease,border-color var
     <div class="stitle" style="color:var(--gold)">🐂 小牛推薦關注 <span style="font-size:11px;color:var(--dim);font-weight:400">基本面 + 法人動向 + 營收成長分析 · 僅供參考</span></div>
     <div class="grid g4" id="rec-grid"><div class="loading"><span class="spin">↻</span> 分析中...</div></div>
   </div>
+  <div id="value-section" style="display:none;margin-bottom:16px">
+    <div class="stitle" style="color:var(--green)">🎩 巴菲特價值選股 <span style="font-size:11px;color:var(--dim);font-weight:400">好公司 + 合理價格 + 安全邊際 · 財報品質排名 · 僅供參考</span></div>
+    <div id="value-grid"><div class="loading"><span class="spin">↻</span> 價值分析中...</div></div>
+  </div>
   <div id="sell-section" style="display:none;margin-bottom:16px">
     <div class="stitle" style="color:var(--red)">⚠️ 建議留意 — 賣出觀察 <span style="font-size:11px;color:var(--dim);font-weight:400">基本面轉弱 + 法人賣超 · 僅供參考</span></div>
     <div class="grid g4" id="sell-grid"><div class="loading"><span class="spin">↻</span> 分析中...</div></div>
@@ -1634,6 +1638,32 @@ async function loadNewsPicks(){
   }catch(e){$('news-picks-section').style.display='none'}
 }
 
+async function loadValuePicks(){
+  try{
+    const r=await fetch('/api/value_picks');const data=await r.json();
+    if(!data.length){$('value-section').style.display='none';return}
+    $('value-section').style.display='block';
+    $('value-grid').innerHTML='<div class="grid g4" style="display:grid;gap:10px">'+data.map(s=>{
+      const vc={'🎩':'#10b981','🟢':'#10b981','🟡':'#f5b731','🔴':'#ef4444'}[s.verdict_icon]||'#6b7fa3';
+      const mos=s.margin_of_safety;
+      const mosHtml=(mos!=null)?`<span style="font-size:10px;padding:2px 6px;border-radius:4px;background:${mos>=0?'rgba(16,185,129,.12)':'rgba(245,183,49,.12)'};color:${mos>=0?'#10b981':'#f5b731'};font-weight:600">${mos>=0?'低估 +'+mos:'偏貴 '+mos}%</span>`:'';
+      const metrics=[];
+      if(s.roe!=null)metrics.push(`ROE ${s.roe}%`);
+      if(s.pe!=null)metrics.push(`PE ${s.pe}`);
+      if(s.dividend_yield!=null&&s.dividend_yield>0)metrics.push(`殖利 ${s.dividend_yield}%`);
+      return`<div class="np-card" style="border-left:3px solid ${vc}">
+        <div class="np-head"><div><div class="nm">${s.name}</div><div class="cd">${s.code}</div></div><div class="pr ${cc(s.change)||''}">${s.price}</div></div>
+        <div style="display:flex;align-items:center;gap:6px;margin:6px 0;flex-wrap:wrap">
+          <span style="font-size:13px;font-weight:800;color:${vc}">${s.verdict_icon} ${s.score}</span>
+          <span style="font-size:11px;color:${vc};font-weight:600">${s.verdict}</span>
+          ${mosHtml}
+        </div>
+        <div style="font-size:11px;color:var(--dim);margin-bottom:4px">${metrics.join(' · ')}</div>
+        ${s.pros&&s.pros.length?`<div style="font-size:10.5px;line-height:1.6">${s.pros.map(p=>'✅ '+p).join('<br>')}</div>`:''}
+      </div>`}).join('')+'</div>';
+  }catch(e){$('value-section').style.display='none'}
+}
+
 async function loadRecommend(){
   try{
     const r=await fetch('/api/recommend');
@@ -2214,6 +2244,50 @@ async function querySignal(){
       </div>`;
     }
 
+    // 🎩 Buffett value-investing view
+    let buffettHtml='';
+    if(s.buffett&&s.buffett.available){
+      const b=s.buffett;
+      const bvc={'🎩':'#10b981','🟢':'#10b981','🟡':'#f5b731','⚪':'#6b7fa3','🔴':'#ef4444'}[b.verdict_icon]||'#6b7fa3';
+      const m=[];
+      if(b.roe!=null)m.push(`ROE <b>${b.roe}%</b>`);
+      if(!b.is_financial){
+        if(b.gross_margin!=null)m.push(`毛利率 <b>${b.gross_margin}%</b>`);
+        if(b.net_margin!=null&&b.net_margin<=100)m.push(`淨利率 <b>${b.net_margin}%</b>`);
+        if(b.debt_ratio!=null)m.push(`負債比 <b>${b.debt_ratio}%</b>`);
+      }else if(b.book_value!=null){m.push(`每股淨值 <b>${b.book_value}</b>`);}
+      if(b.eps!=null)m.push(`EPS <b>${b.eps}</b>${b.period?' ('+b.period+')':''}`);
+      let fairHtml='';
+      if(b.fair_price!=null&&b.margin_of_safety!=null){
+        const mos=b.margin_of_safety, under=mos>=0;
+        const mosColor=under?'#10b981':'#f5b731';
+        const mosLabel=under?`低估 +${mos}%`:`偏貴 ${mos}%`;
+        fairHtml=`<div style="display:flex;align-items:center;gap:10px;margin-top:8px;padding:8px 10px;background:var(--bg);border-radius:8px;flex-wrap:wrap">
+          <div><div style="font-size:10px;color:var(--dim)">參考合理價</div><div style="font-size:16px;font-weight:800">${b.fair_price}</div></div>
+          <div style="font-size:11px;color:var(--dim)">vs 現價 ${s.price}</div>
+          <div style="margin-left:auto;padding:3px 10px;border-radius:12px;background:${mosColor}22;color:${mosColor};font-weight:700;font-size:12px">${mosLabel}</div>
+        </div>`;
+      }
+      const prosHtml=(b.pros||[]).map(p=>`<div style="font-size:11px;margin:2px 0">✅ ${p}</div>`).join('');
+      const consHtml=(b.cons||[]).map(p=>`<div style="font-size:11px;margin:2px 0;color:var(--dim)">⚠️ ${p}</div>`).join('');
+      buffettHtml=`<div style="margin:10px 0;padding:12px;background:${bvc}0e;border:1px solid ${bvc}40;border-radius:10px">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+          <div style="font-size:13px;font-weight:800">🎩 巴菲特觀點</div>
+          <div style="font-size:10px;color:var(--dim)">長期價值</div>
+          <div style="margin-left:auto;font-size:18px;font-weight:800;color:${bvc}">${b.score}<span style="font-size:11px;color:var(--dim)">/100</span></div>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+          <div style="font-size:20px">${b.verdict_icon}</div>
+          <div><div style="font-size:15px;font-weight:800;color:${bvc}">${b.verdict}</div>
+          <div style="font-size:11px;color:var(--dim)">${b.verdict_desc}</div></div>
+        </div>
+        ${m.length?`<div style="font-size:11px;margin:8px 0;line-height:1.9">${m.join(' · ')}</div>`:''}
+        ${fairHtml}
+        ${prosHtml||consHtml?`<div style="margin-top:8px">${prosHtml}${consHtml}</div>`:''}
+        <div style="font-size:9px;color:var(--dim);margin-top:8px">※ 合理價為簡易估算僅供參考，價值投資重視長期持有與安全邊際</div>
+      </div>`;
+    }
+
     el.innerHTML=`<div class="sig-card" style="border-left:4px solid ${vc}">
       <div class="sig-head">
         <div>
@@ -2237,6 +2311,8 @@ async function querySignal(){
           <div style="font-size:14px;font-weight:700"><span style="color:var(--green)">${s.bullish_weight}</span> / <span style="color:var(--red)">${s.bearish_weight}</span></div>
         </div>
       </div>
+
+      ${buffettHtml}
 
       <div style="padding:8px 4px;margin:6px 0">
         ${scoreBar('技術面','📈',s.tech_score||0,10)}
@@ -2437,7 +2513,7 @@ setInterval(checkPriceAlerts,15000);
 function refreshAll(){
   countdown=30;
   $('refresh-btn').classList.add('spin');
-  Promise.all([loadIndex(),loadWL(),loadMovers(),loadVolRank(),loadRecommend(),loadSellRecommend(),loadNewsPicks(),loadGlobal(),loadDailySummary()])
+  Promise.all([loadIndex(),loadWL(),loadMovers(),loadVolRank(),loadRecommend(),loadSellRecommend(),loadNewsPicks(),loadValuePicks(),loadGlobal(),loadDailySummary()])
     .finally(()=>setTimeout(()=>$('refresh-btn').classList.remove('spin'),800));
 }
 

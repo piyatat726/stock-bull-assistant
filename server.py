@@ -752,6 +752,26 @@ def _safe_int(v, default=0):
     except (ValueError, TypeError):
         return default
 
+def _wilder_rsi(closes, period=14):
+    """RSI(14) with Wilder's exponential smoothing — the method brokerage
+    charting software uses, so values match what users see in their app."""
+    if len(closes) < period + 1:
+        return None
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i - 1]
+        gains.append(max(diff, 0.0))
+        losses.append(max(-diff, 0.0))
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return round(100 - (100 / (1 + rs)), 1)
+
 def fetch_daily_history(code, market, months=6):
     """Unified daily OHLCV history fetcher.
 
@@ -1196,6 +1216,410 @@ def _fetch_revenue_growth():
         pass
     return result
 
+def _ffloat(v):
+    """Parse a financial-statement string field to float, else None."""
+    try:
+        s = str(v).strip().replace(',', '')
+        if not s or s == '-':
+            return None
+        return float(s)
+    except (ValueError, TypeError):
+        return None
+
+def _fetch_fundamentals():
+    """Quarterly financial-statement metrics (income statement + balance sheet)
+    for all TSE + OTC companies. Per stock computes: eps, roe (annualized %),
+    gross/op/net margin (%), debt_ratio (%), book_value, equity, net_income,
+    revenue, period. Statements are cumulative YTD, so ROE/EPS annualize by
+    4/quarter. Cached 6h (data only changes quarterly)."""
+    result = {}
+
+    def _ingest_income(rows, code_key, season_key, is_fin=False):
+        for row in rows:
+            try:
+                code = str(row.get(code_key, '')).strip()
+                if not code:
+                    continue
+                net = _ffloat(row.get('本期淨利（淨損）')
+                              or row.get('淨利（損）歸屬於母公司業主')
+                              or row.get('淨利（淨損）歸屬於母公司業主'))
+                eps = _ffloat(row.get('基本每股盈餘（元）'))
+                season = str(row.get(season_key, '') or row.get('Season', '') or '').strip()
+                year = str(row.get('年度', '') or row.get('Year', '') or '').strip()
+                d = result.setdefault(code, {})
+                d['net_income'] = net
+                d['eps'] = eps
+                d['is_financial'] = is_fin
+                ind = str(row.get('產業別', '') or '').strip()
+                if ind:
+                    d['industry'] = ind
+                try:
+                    d['quarter'] = int(season) if season else None
+                except ValueError:
+                    d['quarter'] = None
+                if year and season:
+                    d['period'] = f'{year}Q{season}'
+                if not is_fin:
+                    rev = _ffloat(row.get('營業收入'))
+                    gross = _ffloat(row.get('營業毛利（毛損）淨額') or row.get('營業毛利（毛損）'))
+                    op = _ffloat(row.get('營業利益（損失）'))
+                    d['revenue'] = rev
+                    if rev and rev > 0:
+                        if gross is not None:
+                            d['gross_margin'] = round(gross / rev * 100, 1)
+                        if op is not None:
+                            d['op_margin'] = round(op / rev * 100, 1)
+                        if net is not None:
+                            d['net_margin'] = round(net / rev * 100, 1)
+            except Exception:
+                continue
+
+    def _ingest_balance(rows, code_key, is_fin=False):
+        for row in rows:
+            try:
+                code = str(row.get(code_key, '')).strip()
+                if not code:
+                    continue
+                equity = _ffloat(row.get('權益總額') or row.get('權益總計')
+                                 or row.get('歸屬於母公司業主之權益合計'))
+                book = _ffloat(row.get('每股參考淨值'))
+                d = result.setdefault(code, {})
+                d['equity'] = equity
+                d['book_value'] = book
+                if not is_fin:
+                    # Debt ratio is meaningful only for non-financials (a bank's
+                    # deposits aren't "debt" in the Buffett sense).
+                    assets = _ffloat(row.get('資產總額'))
+                    liab = _ffloat(row.get('負債總額'))
+                    if assets and assets > 0 and liab is not None:
+                        d['debt_ratio'] = round(liab / assets * 100, 1)
+            except Exception:
+                continue
+
+    # Income statements — general industry (TSE+OTC) then financial sectors (金控/銀行/保險)
+    for url, ck, sk in [
+        ('https://openapi.twse.com.tw/v1/opendata/t187ap06_L_ci', '公司代號', '季別'),
+        ('https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap06_O_ci', 'SecuritiesCompanyCode', 'Season'),
+    ]:
+        try:
+            data = cached_get(url, ttl=21600)
+            if isinstance(data, list):
+                _ingest_income(data, ck, sk, is_fin=False)
+        except Exception:
+            pass
+    for url in ['https://openapi.twse.com.tw/v1/opendata/t187ap06_L_fh',
+                'https://openapi.twse.com.tw/v1/opendata/t187ap06_L_basi',
+                'https://openapi.twse.com.tw/v1/opendata/t187ap06_L_ins']:
+        try:
+            data = cached_get(url, ttl=21600)
+            if isinstance(data, list):
+                _ingest_income(data, '公司代號', '季別', is_fin=True)
+        except Exception:
+            pass
+    # Balance sheets — general then financial
+    for url, ck in [
+        ('https://openapi.twse.com.tw/v1/opendata/t187ap07_L_ci', '公司代號'),
+        ('https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap07_O_ci', 'SecuritiesCompanyCode'),
+    ]:
+        try:
+            data = cached_get(url, ttl=21600)
+            if isinstance(data, list):
+                _ingest_balance(data, ck, is_fin=False)
+        except Exception:
+            pass
+    for url in ['https://openapi.twse.com.tw/v1/opendata/t187ap07_L_fh',
+                'https://openapi.twse.com.tw/v1/opendata/t187ap07_L_basi',
+                'https://openapi.twse.com.tw/v1/opendata/t187ap07_L_ins']:
+        try:
+            data = cached_get(url, ttl=21600)
+            if isinstance(data, list):
+                _ingest_balance(data, '公司代號', is_fin=True)
+        except Exception:
+            pass
+
+    # Industry (產業別) lives in the 營益分析 table, not the income statement —
+    # needed to flag cyclical industries (shipping/steel/plastics).
+    for url, ck in [
+        ('https://openapi.twse.com.tw/v1/opendata/t187ap14_L', '公司代號'),
+        ('https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap14_O', 'SecuritiesCompanyCode'),
+    ]:
+        try:
+            data = cached_get(url, ttl=21600)
+            if isinstance(data, list):
+                for row in data:
+                    code = str(row.get(ck, '')).strip()
+                    ind = str(row.get('產業別', '') or '').strip()
+                    if code and ind and code in result:
+                        result[code]['industry'] = ind
+        except Exception:
+            pass
+
+    # ROE = annualized net income / equity (cumulative YTD → ×4/quarter).
+    # Fallback: annualized EPS / book value per share (per-share consistent —
+    # works for financial holdings where the total-net-income field is blank).
+    for code, d in result.items():
+        ni, eq, q = d.get('net_income'), d.get('equity'), d.get('quarter')
+        factor = 4 / q if q else 4
+        eps_ann = round(d['eps'] * factor, 2) if d.get('eps') is not None else None
+        d['eps_annual'] = eps_ann
+        roe = None
+        if ni is not None and eq and eq > 0:
+            roe = round(ni / eq * 100 * factor, 1)
+        elif eps_ann is not None and d.get('book_value') and d['book_value'] > 0:
+            roe = round(eps_ann / d['book_value'] * 100, 1)
+        # Annualizing a single strong quarter (×4) can over-state ROE; cap the
+        # display at a high-but-believable ceiling to avoid artifacts like 104%.
+        if roe is not None and roe > 60:
+            roe = 60.0
+        d['roe'] = roe
+    return result
+
+def _fair_price(pe, price, roe, rev_yoy, debt, is_fin):
+    """Reference fair price via a fair-PE multiple. Growth premium is gated on
+    decent ROE so cyclical stocks at peak earnings (low PE, high temporary
+    growth) don't get an inflated valuation."""
+    if pe is None or pe <= 0 or not price:
+        return None, None
+    fair_pe = 11.0 if is_fin else 15.0
+    if roe is not None:
+        fair_pe += min(max((roe - 10) * 0.4, -5), 7)
+    # Growth premium only when quality (ROE) supports it — avoids cyclical trap
+    if rev_yoy is not None and (roe is None or roe >= 10):
+        fair_pe += min(max(rev_yoy * 0.10, -3), 4)
+    if debt is not None and debt > 70:
+        fair_pe -= 2
+    cap = 16.0 if is_fin else 24.0
+    fair_pe = max(7.0, min(fair_pe, cap))
+    fp = round(price * fair_pe / pe, 2)
+    # A simple PE model can't credibly claim huge mispricing — clamp to ±60%
+    mos = max(-60.0, min((fp - price) / price * 100, 60.0))
+    return fp, round(mos, 1)
+
+
+def buffett_score(fund, pe, pb, dy, rev_yoy, price):
+    """Value-investing scorecard in the spirit of Buffett: a wonderful business
+    (high ROE, fat margins, low debt) at a fair price (sensible PE/PB) with a
+    margin of safety. Financials are scored on ROE + valuation + dividend
+    (margins/debt don't apply to banks). Returns score 0-100, breakdown,
+    plain-language verdict + reasons, and a reference fair price."""
+    fund = fund or {}
+    roe = fund.get('roe')
+    nm = fund.get('net_margin')
+    gm = fund.get('gross_margin')
+    debt = fund.get('debt_ratio')
+    ni = fund.get('net_income')
+    is_fin = bool(fund.get('is_financial'))
+    pros, cons = [], []
+
+    # Cap one-off-inflated net margin for messaging (e.g. huge non-operating gains)
+    nm_real = nm if (nm is not None and nm <= 100) else None
+
+    has_fundamentals = any(x is not None for x in (roe, nm, gm, debt))
+    fair_price, margin_of_safety = _fair_price(pe, price, roe, rev_yoy, debt, is_fin)
+
+    # ── No fundamentals at all → valuation-only soft read (never harsh "避開") ──
+    if not has_fundamentals:
+        if pe is None and pb is None:
+            return {'available': False}
+        v = 0
+        if pe is not None and pe > 0:
+            if pe < 12: v += 40; pros.append(f'本益比 {pe:.0f} 倍，估值便宜')
+            elif pe < 18: v += 30; pros.append(f'本益比 {pe:.0f} 倍，估值合理')
+            elif pe < 25: v += 18
+            elif pe < 40: v += 8; cons.append(f'本益比 {pe:.0f} 倍偏貴')
+        if pb is not None:
+            if pb < 1.5: v += 25
+            elif pb < 3: v += 16
+            elif pb < 5: v += 8
+        if dy is not None:
+            if dy >= 4: v += 20; pros.append(f'殖利率 {dy:.1f}%')
+            elif dy >= 2: v += 12
+            elif dy > 0: v += 5
+        if rev_yoy is not None and rev_yoy >= 10:
+            v += 15; pros.append(f'營收年增 {rev_yoy:+.0f}%')
+        return {
+            'available': True, 'limited': True, 'score': min(v, 100),
+            'quality': 0, 'health': 0, 'value': v, 'growth': 0, 'dividend': 0,
+            'verdict': '財報資料有限', 'verdict_icon': '⚪',
+            'verdict_desc': '缺少完整財報，僅依估值面參考，無法做價值評等',
+            'pros': pros[:4], 'cons': cons[:3],
+            'fair_price': fair_price, 'margin_of_safety': margin_of_safety,
+            'roe': roe, 'net_margin': nm, 'gross_margin': gm, 'debt_ratio': debt,
+            'eps': fund.get('eps'), 'book_value': fund.get('book_value'),
+            'period': fund.get('period'), 'is_financial': is_fin,
+        }
+
+    cheap = (margin_of_safety is not None and margin_of_safety >= 10)
+    fair = (margin_of_safety is not None and margin_of_safety >= -10)
+
+    if is_fin:
+        # ── Financial scorecard: ROE(35) + Value(40) + Dividend(25) ──
+        q = 0
+        if roe is not None:
+            if roe >= 15: q += 35; pros.append(f'ROE 高達 {roe:.0f}%，金融股中的績優生')
+            elif roe >= 12: q += 28; pros.append(f'ROE {roe:.0f}%，獲利能力佳')
+            elif roe >= 10: q += 22; pros.append(f'ROE {roe:.0f}%，穩健')
+            elif roe >= 8: q += 15
+            elif roe >= 5: q += 8
+            elif roe >= 0: q += 3
+            else: cons.append(f'ROE 為負 ({roe:.0f}%)，本期虧損')
+        v = 0
+        if pe is not None and pe > 0:
+            if pe < 8: v += 22; pros.append(f'本益比僅 {pe:.0f} 倍，便宜')
+            elif pe < 10: v += 18
+            elif pe < 12: v += 15; pros.append(f'本益比 {pe:.0f} 倍，合理')
+            elif pe < 15: v += 11
+            elif pe < 18: v += 7
+            elif pe < 25: v += 3
+            else: cons.append(f'本益比 {pe:.0f} 倍偏高')
+        if pb is not None:
+            if pb < 0.8: v += 18; pros.append(f'股價淨值比 {pb:.1f}，低於每股淨值')
+            elif pb < 1.2: v += 15; pros.append(f'淨值比 {pb:.1f}，接近淨值')
+            elif pb < 1.5: v += 12
+            elif pb < 2: v += 8
+            elif pb < 2.5: v += 5
+            else: v += 2; cons.append(f'淨值比 {pb:.1f}，溢價偏高')
+        dvd = 0
+        if dy is not None:
+            if dy >= 6: dvd += 25; pros.append(f'殖利率 {dy:.1f}%，存股優選')
+            elif dy >= 5: dvd += 21; pros.append(f'殖利率 {dy:.1f}%，配息優渥')
+            elif dy >= 4: dvd += 16; pros.append(f'殖利率 {dy:.1f}%，配息穩定')
+            elif dy >= 3: dvd += 11
+            elif dy >= 2: dvd += 6
+            elif dy > 0: dvd += 3
+        h = 0; g = 0
+        total = q + v + dvd
+        quality_pts = q          # out of 35
+        strong = quality_pts >= 22   # ROE ≥ ~10
+        if roe is not None and roe < 0:
+            verdict, vicon = '本期虧損、避開', '🔴'
+            vdesc = '金融股本期虧損，價值投資不碰'
+        elif strong and cheap:
+            verdict, vicon = '好金融股 + 好價格', '🎩'
+            vdesc = 'ROE 穩健且價格有安全邊際，適合長期存股'
+        elif strong and fair:
+            verdict, vicon = '穩健金融股、價格合理', '🟢'
+            vdesc = 'ROE 不錯、估值合理，適合分批佈局存股'
+        elif strong:
+            verdict, vicon = '穩健金融股、偏貴', '🟡'
+            vdesc = '體質不錯但目前偏貴，可等回檔再進'
+        elif quality_pts >= 15:
+            verdict, vicon = '中等金融股', '🟡'
+            vdesc = 'ROE 普通，宜留意獲利與利差變化'
+        else:
+            verdict, vicon = '金融股體質偏弱', '🔴'
+            vdesc = 'ROE 偏低，獲利能力不足'
+    else:
+        # ── General-industry scorecard: Quality(35)+Health(20)+Value(25)+Growth(10)+Dividend(10) ──
+        q = 0
+        if roe is not None:
+            if roe >= 20: q += 15; pros.append(f'股東報酬率(ROE)高達 {roe:.0f}%，賺錢效率一流')
+            elif roe >= 15: q += 12; pros.append(f'ROE {roe:.0f}%，獲利能力優秀')
+            elif roe >= 10: q += 8; pros.append(f'ROE {roe:.0f}%，獲利能力穩健')
+            elif roe >= 5: q += 4
+            elif roe >= 0: q += 1
+            else: cons.append(f'ROE 為負 ({roe:.0f}%)，股東的錢沒在賺錢')
+        if nm is not None:
+            if nm >= 20: q += 10
+            elif nm >= 10: q += 7
+            elif nm >= 5: q += 4
+            elif nm >= 0: q += 2
+            else: cons.append(f'淨利率為負 ({nm:.0f}%)，本業在虧損')
+            if nm_real is not None and nm_real >= 20:
+                pros.append(f'淨利率 {nm_real:.0f}%，每塊營收留下很多獲利')
+        if gm is not None:
+            if gm >= 40: q += 10; pros.append(f'毛利率 {gm:.0f}%，產品有定價權(護城河)')
+            elif gm >= 25: q += 7
+            elif gm >= 15: q += 4
+            else: q += 2
+        h = 0
+        if debt is not None:
+            if debt < 30: h += 12; pros.append(f'負債比僅 {debt:.0f}%，財務體質穩健')
+            elif debt < 50: h += 9
+            elif debt < 65: h += 5
+            elif debt < 80: h += 2; cons.append(f'負債比 {debt:.0f}%，槓桿偏高')
+            else: cons.append(f'負債比高達 {debt:.0f}%，財務風險大')
+        if ni is not None:
+            if ni > 0: h += 8
+            else: cons.append('公司目前處於虧損狀態')
+        v = 0
+        if pe is not None:
+            if pe < 0: cons.append('本益比為負(虧損)，無法用 PE 評價')
+            elif pe < 12: v += 15; pros.append(f'本益比僅 {pe:.0f} 倍，估值便宜')
+            elif pe < 16: v += 12; pros.append(f'本益比 {pe:.0f} 倍，估值合理')
+            elif pe < 20: v += 9
+            elif pe < 28: v += 6
+            elif pe < 40: v += 3; cons.append(f'本益比 {pe:.0f} 倍，估值偏貴')
+            else: cons.append(f'本益比高達 {pe:.0f} 倍，價格昂貴')
+        if pb is not None:
+            if pb < 1.5: v += 10; pros.append(f'股價淨值比 {pb:.1f}，接近資產價值')
+            elif pb < 3: v += 7
+            elif pb < 5: v += 4
+            elif pb < 8: v += 2
+            else: v += 1; cons.append(f'淨值比 {pb:.1f}，市場給予高溢價')
+        g = 0
+        if rev_yoy is not None:
+            if rev_yoy >= 20: g += 10; pros.append(f'營收年增 {rev_yoy:+.0f}%，成長動能強')
+            elif rev_yoy >= 10: g += 7
+            elif rev_yoy >= 3: g += 4
+            elif rev_yoy >= 0: g += 2
+            else: cons.append(f'營收年減 {rev_yoy:.0f}%，成長轉弱')
+        dvd = 0
+        if dy is not None:
+            if dy >= 5: dvd += 10; pros.append(f'殖利率 {dy:.1f}%，配息優渥')
+            elif dy >= 3: dvd += 7; pros.append(f'殖利率 {dy:.1f}%，配息穩定')
+            elif dy >= 1.5: dvd += 4
+            elif dy > 0: dvd += 2
+        total = q + h + v + g + dvd
+        quality_pts = q + h          # out of 55
+        # Cyclical-peak detection: a low PE in a cyclical industry (shipping,
+        # steel, cement, plastics…) with only mediocre ROE is the classic
+        # "value trap" at the top of a cycle — cheap is an illusion.
+        CYCLICAL_IND = ('航運', '鋼鐵', '水泥', '造紙', '橡膠', '塑膠', '玻璃')
+        ind = fund.get('industry', '') or ''
+        cyclical = (
+            (nm is not None and nm < 12 and pe is not None and 0 < pe < 12
+             and rev_yoy is not None and rev_yoy > 15)
+            or (pe is not None and 0 < pe < 10 and pb is not None and pb < 1.5
+                and dy is not None and dy > 5 and (roe is None or roe < 15))
+            or (any(c in ind for c in CYCLICAL_IND) and pe is not None
+                and 0 < pe < 15 and (roe is None or roe < 18))
+        )
+        if ni is not None and ni < 0:
+            verdict, vicon = '不符合價值投資', '🔴'
+            vdesc = '公司虧損中，巴菲特只買持續賺錢的好公司'
+        elif cyclical:
+            verdict, vicon = '景氣循環股、當心', '🟡'
+            vdesc = '低本益比可能是處於獲利高峰的循環股，便宜是假象，須留意獲利反轉'
+        elif quality_pts >= 40 and cheap:
+            verdict, vicon = '好公司 + 好價格', '🎩'
+            vdesc = '體質優異且價格有安全邊際，正是價值投資的甜蜜點'
+        elif quality_pts >= 40 and fair:
+            verdict, vicon = '好公司、價格合理', '🟢'
+            vdesc = '是值得長抱的好公司，目前價格尚屬合理'
+        elif quality_pts >= 40:
+            verdict, vicon = '好公司、但偏貴', '🟡'
+            vdesc = '基本面很好，但現價偏貴，建議等回檔出現安全邊際'
+        elif quality_pts >= 24:
+            verdict, vicon = '體質中等', '🟡'
+            vdesc = '基本面尚可但稱不上頂尖，須留意產業與獲利變化'
+        else:
+            verdict, vicon = '體質偏弱、避開', '🔴'
+            vdesc = '獲利能力或財務體質不足，不符合長期價值投資標準'
+
+    return {
+        'available': True,
+        'score': total,
+        'quality': q, 'health': h, 'value': v, 'growth': g, 'dividend': dvd,
+        'verdict': verdict, 'verdict_icon': vicon, 'verdict_desc': vdesc,
+        'pros': pros[:5], 'cons': cons[:4],
+        'fair_price': fair_price, 'margin_of_safety': margin_of_safety,
+        'roe': roe, 'net_margin': nm, 'gross_margin': gm, 'debt_ratio': debt,
+        'eps': fund.get('eps'), 'eps_annual': fund.get('eps_annual'),
+        'book_value': fund.get('book_value'), 'period': fund.get('period'),
+        'is_financial': is_fin,
+    }
+
 def _fetch_institutional():
     """Fetch institutional net buy/sell data (三大法人買賣超)"""
     inst_map = {}
@@ -1225,6 +1649,46 @@ def _fetch_institutional():
         except Exception:
             continue
     return inst_map
+
+@app.route('/api/value_picks')
+def value_picks():
+    """Buffett value-investing leaderboard: rank stocks by the value scorecard
+    (wonderful business — high ROE / margins / low debt or strong financials —
+    at a fair price with margin of safety)."""
+    fund_map = _fetch_pe_pb_yield()
+    rev_map = _fetch_revenue_growth()
+    fundamentals = _fetch_fundamentals()
+    pairs = ([(c, 'tse') for c in dict.fromkeys(POPULAR_TSE)] +
+             [(c, 'otc') for c in dict.fromkeys(POPULAR_OTC)])
+    stocks = fetch_stocks(pairs)
+    seen = set()
+    results = []
+    for s in stocks:
+        code = s['code']
+        if code in seen or not s.get('price'):
+            continue
+        seen.add(code)
+        f = fund_map.get(code, {})
+        b = buffett_score(fundamentals.get(code, {}), f.get('pe'), f.get('pb'),
+                          f.get('yield'), rev_map.get(code, {}).get('yoy'), s['price'])
+        if not b.get('available') or b.get('limited'):
+            continue
+        results.append({
+            'code': code, 'name': s['name'], 'price': s['price'],
+            'change_pct': s.get('change_pct', 0), 'market': s.get('market', 'tse'),
+            'score': b['score'], 'verdict': b['verdict'], 'verdict_icon': b['verdict_icon'],
+            'verdict_desc': b['verdict_desc'],
+            'roe': b['roe'], 'pe': f.get('pe'), 'pb': f.get('pb'),
+            'dividend_yield': f.get('yield'),
+            'fair_price': b['fair_price'], 'margin_of_safety': b['margin_of_safety'],
+            'is_financial': b.get('is_financial', False), 'pros': b['pros'][:2],
+        })
+    # Rank by score, but demote cyclical-peak "value traps" so real compounders lead
+    def _rank(x):
+        pen = 25 if '景氣循環' in x['verdict'] else 0
+        return (x['score'] - pen, x['margin_of_safety'] if x['margin_of_safety'] is not None else -999)
+    results.sort(key=_rank, reverse=True)
+    return jsonify(results[:15])
 
 @app.route('/api/recommend')
 def recommend():
@@ -2407,21 +2871,7 @@ def entry_signals():
         return fetch_daily_history(code, market, months=months)
 
     def calc_rsi(closes, period=14):
-        if len(closes) < period + 1:
-            return None
-        gains, losses = [], []
-        for i in range(1, len(closes)):
-            diff = closes[i] - closes[i - 1]
-            gains.append(max(diff, 0))
-            losses.append(max(-diff, 0))
-        if len(gains) < period:
-            return None
-        avg_gain = sum(gains[-period:]) / period
-        avg_loss = sum(losses[-period:]) / period
-        if avg_loss == 0:
-            return 100.0
-        rs = avg_gain / avg_loss
-        return round(100 - (100 / (1 + rs)), 1)
+        return _wilder_rsi(closes, period)
 
     def calc_kd(highs, lows, closes, k_period=9, k_smooth=3, d_smooth=3):
         if len(closes) < k_period + k_smooth + d_smooth:
@@ -2746,19 +3196,7 @@ def portfolio_signals():
             rt_map[s['code']] = s
 
     def calc_rsi(closes, period=14):
-        if len(closes) < period + 1:
-            return None
-        gains, losses = [], []
-        for i in range(1, len(closes)):
-            diff = closes[i] - closes[i - 1]
-            gains.append(max(diff, 0))
-            losses.append(max(-diff, 0))
-        avg_gain = sum(gains[-period:]) / period
-        avg_loss = sum(losses[-period:]) / period
-        if avg_loss == 0:
-            return 100.0
-        rs = avg_gain / avg_loss
-        return round(100 - (100 / (1 + rs)), 1)
+        return _wilder_rsi(closes, period)
 
     def calc_kd(highs, lows, closes, k_period=9):
         if len(closes) < k_period + 6:
@@ -2959,21 +3397,7 @@ def stock_signal():
 
     # Helper functions (same as entry_signals)
     def calc_rsi(closes, period=14):
-        if len(closes) < period + 1:
-            return None
-        gains, losses = [], []
-        for i in range(1, len(closes)):
-            diff = closes[i] - closes[i - 1]
-            gains.append(max(diff, 0))
-            losses.append(max(-diff, 0))
-        if len(gains) < period:
-            return None
-        avg_gain = sum(gains[-period:]) / period
-        avg_loss = sum(losses[-period:]) / period
-        if avg_loss == 0:
-            return 100.0
-        rs = avg_gain / avg_loss
-        return round(100 - (100 / (1 + rs)), 1)
+        return _wilder_rsi(closes, period)
 
     def calc_kd(highs, lows, closes, k_period=9, k_smooth=3, d_smooth=3):
         if len(closes) < k_period + k_smooth + d_smooth:
@@ -3353,6 +3777,9 @@ def stock_signal():
         elif yoy <= -5:
             fund_signals.append({'type': '營收下滑', 'icon': '📉', 'desc': f'營收年減 {yoy:.1f}%', 'weight': -1, 'bullish': False, 'cat': 'fundamental'})
 
+    # ── 🎩 Buffett value-investing view (財報品質 + 估值 + 安全邊際) ──
+    buffett = buffett_score(_fetch_fundamentals().get(code, {}), pe, pb, dy, yoy, price)
+
     # ═══════════════════════════════════════════
     # PART 3: Institutional / Chip analysis (籌碼面)
     # ═══════════════════════════════════════════
@@ -3546,6 +3973,8 @@ def stock_signal():
         'margin': margin_data,
         # News
         'news': news,
+        # 🎩 Buffett value-investing analysis
+        'buffett': buffett,
     })
 
 @app.route('/api/network_info')
