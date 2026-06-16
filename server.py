@@ -1296,63 +1296,44 @@ def _fetch_fundamentals():
             except Exception:
                 continue
 
-    # Income statements — general industry (TSE+OTC) then financial sectors (金控/銀行/保險)
-    for url, ck, sk in [
-        ('https://openapi.twse.com.tw/v1/opendata/t187ap06_L_ci', '公司代號', '季別'),
-        ('https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap06_O_ci', 'SecuritiesCompanyCode', 'Season'),
-    ]:
-        try:
-            data = cached_get(url, ttl=21600)
-            if isinstance(data, list):
-                _ingest_income(data, ck, sk, is_fin=False)
-        except Exception:
-            pass
-    for url in ['https://openapi.twse.com.tw/v1/opendata/t187ap06_L_fh',
-                'https://openapi.twse.com.tw/v1/opendata/t187ap06_L_basi',
-                'https://openapi.twse.com.tw/v1/opendata/t187ap06_L_ins']:
-        try:
-            data = cached_get(url, ttl=21600)
-            if isinstance(data, list):
-                _ingest_income(data, '公司代號', '季別', is_fin=True)
-        except Exception:
-            pass
-    # Balance sheets — general then financial
-    for url, ck in [
-        ('https://openapi.twse.com.tw/v1/opendata/t187ap07_L_ci', '公司代號'),
-        ('https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap07_O_ci', 'SecuritiesCompanyCode'),
-    ]:
-        try:
-            data = cached_get(url, ttl=21600)
-            if isinstance(data, list):
-                _ingest_balance(data, ck, is_fin=False)
-        except Exception:
-            pass
-    for url in ['https://openapi.twse.com.tw/v1/opendata/t187ap07_L_fh',
-                'https://openapi.twse.com.tw/v1/opendata/t187ap07_L_basi',
-                'https://openapi.twse.com.tw/v1/opendata/t187ap07_L_ins']:
-        try:
-            data = cached_get(url, ttl=21600)
-            if isinstance(data, list):
-                _ingest_balance(data, '公司代號', is_fin=True)
-        except Exception:
-            pass
-
-    # Industry (產業別) lives in the 營益分析 table, not the income statement —
-    # needed to flag cyclical industries (shipping/steel/plastics).
-    for url, ck in [
-        ('https://openapi.twse.com.tw/v1/opendata/t187ap14_L', '公司代號'),
-        ('https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap14_O', 'SecuritiesCompanyCode'),
-    ]:
-        try:
-            data = cached_get(url, ttl=21600)
-            if isinstance(data, list):
-                for row in data:
-                    code = str(row.get(ck, '')).strip()
-                    ind = str(row.get('產業別', '') or '').strip()
-                    if code and ind and code in result:
-                        result[code]['industry'] = ind
-        except Exception:
-            pass
+    # All statement endpoints: (kind, url, code_key, season_key, is_fin).
+    # Fetched in parallel (12 large payloads) then ingested in a deterministic
+    # order — cuts cold-start latency from ~50s to a few seconds.
+    specs = [
+        ('income', 'https://openapi.twse.com.tw/v1/opendata/t187ap06_L_ci', '公司代號', '季別', False),
+        ('income', 'https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap06_O_ci', 'SecuritiesCompanyCode', 'Season', False),
+        ('income', 'https://openapi.twse.com.tw/v1/opendata/t187ap06_L_fh', '公司代號', '季別', True),
+        ('income', 'https://openapi.twse.com.tw/v1/opendata/t187ap06_L_basi', '公司代號', '季別', True),
+        ('income', 'https://openapi.twse.com.tw/v1/opendata/t187ap06_L_ins', '公司代號', '季別', True),
+        ('balance', 'https://openapi.twse.com.tw/v1/opendata/t187ap07_L_ci', '公司代號', None, False),
+        ('balance', 'https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap07_O_ci', 'SecuritiesCompanyCode', None, False),
+        ('balance', 'https://openapi.twse.com.tw/v1/opendata/t187ap07_L_fh', '公司代號', None, True),
+        ('balance', 'https://openapi.twse.com.tw/v1/opendata/t187ap07_L_basi', '公司代號', None, True),
+        ('balance', 'https://openapi.twse.com.tw/v1/opendata/t187ap07_L_ins', '公司代號', None, True),
+        ('industry', 'https://openapi.twse.com.tw/v1/opendata/t187ap14_L', '公司代號', None, False),
+        ('industry', 'https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap14_O', 'SecuritiesCompanyCode', None, False),
+    ]
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        fetched = list(pool.map(lambda sp: cached_get(sp[1], ttl=21600), specs))
+    # Ingest income → balance → industry (order matters: industry needs codes present)
+    for order_kind in ('income', 'balance', 'industry'):
+        for (kind, url, ck, sk, is_fin), data in zip(specs, fetched):
+            if kind != order_kind or not isinstance(data, list):
+                continue
+            try:
+                if kind == 'income':
+                    _ingest_income(data, ck, sk, is_fin=is_fin)
+                elif kind == 'balance':
+                    _ingest_balance(data, ck, is_fin=is_fin)
+                else:
+                    for row in data:
+                        code = str(row.get(ck, '')).strip()
+                        ind = str(row.get('產業別', '') or '').strip()
+                        if code and ind and code in result:
+                            result[code]['industry'] = ind
+            except Exception:
+                continue
 
     # ROE = annualized net income / equity (cumulative YTD → ×4/quarter).
     # Fallback: annualized EPS / book value per share (per-share consistent —
