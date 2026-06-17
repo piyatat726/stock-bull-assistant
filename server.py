@@ -63,12 +63,12 @@ except Exception:
     print(f'[WARN] stock_names.json not found, using {len(STOCK_NAMES)} fallback names')
 _name_cache = {}  # dynamic cache from TWSE responses
 
-def cached_get(url, ttl=CACHE_TTL):
+def cached_get(url, ttl=CACHE_TTL, timeout=15):
     now = time.time()
     if url in cache and now - cache[url]['t'] < ttl:
         return cache[url]['data']
     try:
-        r = requests.get(url, headers=HEADERS, timeout=10)
+        r = requests.get(url, headers=HEADERS, timeout=timeout)
         data = r.json()
         cache[url] = {'data': data, 't': now}
         return data
@@ -264,9 +264,11 @@ def fetch_stock_yahoo(code, market='tse'):
 def fetch_stocks(code_market_pairs):
     if not code_market_pairs:
         return []
-    # Try TWSE API first
+    # Try TWSE MIS realtime API first — but with a SHORT timeout: outside
+    # Taiwan (or when MIS is throttled) it can hang ~15s, and we have a fast
+    # Yahoo fallback. In Taiwan MIS answers in <1s so there's no penalty.
     ex_ch = '|'.join([f'{m}_{c}.tw' for c, m in code_market_pairs])
-    data = cached_get(f'{API_BASE}?ex_ch={ex_ch}')
+    data = cached_get(f'{API_BASE}?ex_ch={ex_ch}', timeout=5)
     results = []
     for item in data.get('msgArray', []):
         s = parse_stock(item)
@@ -1601,34 +1603,152 @@ def buffett_score(fund, pe, pb, dy, rev_yoy, price):
         'is_financial': is_fin,
     }
 
-def _fetch_institutional():
-    """Fetch institutional net buy/sell data (三大法人買賣超)"""
-    inst_map = {}
-    today = datetime.date.today()
-    for days_back in range(7):
-        d = today - datetime.timedelta(days=days_back)
-        if d.weekday() >= 5:
-            continue
-        date_str = d.strftime('%Y%m%d')
+def _dividend_quality(code, market, price=None, eps_annual=None):
+    """Dividend track record (存股 / income view) from Yahoo dividend history:
+    consecutive payout years, trailing-12m dividend, payout ratio, trend, and
+    an income-investing score + verdict. Returns None if no dividend record."""
+    suffix = '.TWO' if market == 'otc' else '.TW'
+    events = {}
+    for sfx in [suffix, ('.TW' if suffix == '.TWO' else '.TWO')]:
         try:
-            url = f'https://www.twse.com.tw/fund/T86?response=json&date={date_str}&selectType=ALLBUT0999'
-            data = cached_get(url, ttl=1800)
-            if data.get('stat') == 'OK' and data.get('data'):
-                for row in data['data']:
-                    try:
-                        code = row[0].strip()
-                        name = row[1].strip()
-                        inst_map[code] = {
-                            'name': name,
-                            'foreign': int(row[4].replace(',', '')),   # 外陸資買賣超
-                            'trust': int(row[10].replace(',', '')),    # 投信買賣超
-                            'total': int(row[18].replace(',', '')),    # 三大法人買賣超
-                        }
-                    except (ValueError, IndexError):
-                        continue
+            url = f'https://query1.finance.yahoo.com/v8/finance/chart/{code}{sfx}?interval=1d&range=10y&events=div'
+            d = cached_get(url, ttl=86400)
+            ev = d.get('chart', {}).get('result', [{}])[0].get('events', {}).get('dividends', {})
+            if ev:
+                events = ev
                 break
         except Exception:
             continue
+    if not events:
+        return None
+    now = datetime.datetime.now()
+    by_year = {}
+    ttm = 0.0
+    for v in events.values():
+        try:
+            dt = datetime.datetime.fromtimestamp(v['date'])
+            amt = float(v['amount'])
+            by_year[dt.year] = by_year.get(dt.year, 0.0) + amt
+            if (now - dt).days <= 366:
+                ttm += amt
+        except Exception:
+            continue
+    if not by_year:
+        return None
+    cur = now.year
+    # Consecutive payout years counting back from this year (or last year if
+    # this year hasn't distributed yet).
+    consec = 0
+    start = cur if by_year.get(cur, 0) > 0 else cur - 1
+    y = start
+    while by_year.get(y, 0) > 0:
+        consec += 1
+        y -= 1
+    years_paid = len([y for y, a in by_year.items() if a > 0])
+    # Trend: avg of last 3 completed years vs the 3 before that
+    completed = sorted([yr for yr in by_year if yr < cur])
+    trend = 'stable'
+    if len(completed) >= 4:
+        recent = [by_year[y] for y in completed[-3:]]
+        older = [by_year[y] for y in completed[-6:-3]] or [by_year[completed[0]]]
+        ra, oa = sum(recent) / len(recent), sum(older) / len(older)
+        if ra > oa * 1.15:
+            trend = 'growing'
+        elif ra < oa * 0.85:
+            trend = 'shrinking'
+    ttm = round(ttm, 2)
+    payout = round(ttm / eps_annual * 100, 1) if (eps_annual and eps_annual > 0) else None
+    yld = round(ttm / price * 100, 2) if price else None
+
+    score = 0
+    if consec >= 10: score += 40
+    elif consec >= 5: score += 30
+    elif consec >= 3: score += 20
+    elif consec >= 1: score += 8
+    if yld is not None:
+        if yld >= 5: score += 30
+        elif yld >= 4: score += 25
+        elif yld >= 3: score += 18
+        elif yld >= 2: score += 10
+        elif yld > 0: score += 4
+    if payout is not None:
+        if 30 <= payout <= 70: score += 20
+        elif payout < 30: score += 12
+        elif payout <= 90: score += 8
+        elif payout <= 110: score += 3
+    if trend == 'growing': score += 10
+    elif trend == 'shrinking': score -= 5
+    score = max(0, min(score, 100))
+
+    unsustainable = (payout is not None and payout > 110)
+    extreme_yield = (yld is not None and yld > 10)
+    if unsustainable or (extreme_yield and (payout is None or payout > 90)):
+        verdict, vicon = '高息但恐難持續', '⚠️'
+        vdesc = '配息超過當期獲利（可能來自一次性或景氣高峰），不宜當成長期穩定息源'
+        score = min(score, 45)
+    elif consec >= 8 and (yld or 0) >= 3 and (payout is None or payout <= 85) and trend != 'shrinking':
+        verdict, vicon = '優質存股', '🏆'
+        vdesc = f'連續配息 {consec} 年、殖利率佳且配息可持續，存股首選'
+    elif consec >= 5 and (yld or 0) >= 2.5:
+        verdict, vicon = '穩定存股', '💰'
+        vdesc = f'連續配息 {consec} 年，配息穩定，適合長期持有領息'
+    elif consec >= 3:
+        verdict, vicon = '配息穩定', '📅'
+        vdesc = f'連續配息 {consec} 年，配息紀錄尚可'
+    elif consec >= 1:
+        verdict, vicon = '配息紀錄偏短', '🟡'
+        vdesc = '配息年數不長，存股前建議觀察持續性'
+    else:
+        verdict, vicon = '近年未穩定配息', '⚪'
+        vdesc = '近年未見穩定配息，不適合存股族'
+    notes = []
+    if payout is not None and payout > 100:
+        notes.append('配息率超過 100%，配發超過當期盈餘，留意能否持續')
+    if trend == 'growing':
+        notes.append('股利逐年成長，是很好的訊號')
+    elif trend == 'shrinking':
+        notes.append('近年股利縮水，留意獲利變化')
+
+    return {
+        'consecutive_years': consec, 'years_paid': years_paid,
+        'ttm_dividend': ttm, 'payout_ratio': payout, 'yield': yld,
+        'trend': trend, 'score': score,
+        'verdict': verdict, 'verdict_icon': vicon, 'verdict_desc': vdesc,
+        'notes': notes,
+    }
+
+def _fetch_institutional():
+    """Fetch institutional net buy/sell data (三大法人買賣超). The most recent
+    trading day with data is unknown, so fetch the candidate days in parallel
+    (each T86 payload is large) and use the newest non-empty one."""
+    inst_map = {}
+    today = datetime.date.today()
+    days = [d for d in (today - datetime.timedelta(days=i) for i in range(7)) if d.weekday() < 5]
+
+    def _fetch(d):
+        try:
+            url = f'https://www.twse.com.tw/fund/T86?response=json&date={d.strftime("%Y%m%d")}&selectType=ALLBUT0999'
+            return cached_get(url, ttl=1800)
+        except Exception:
+            return None
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=7) as pool:
+        results = list(pool.map(_fetch, days))  # newest-first order preserved
+
+    for data in results:
+        if isinstance(data, dict) and data.get('stat') == 'OK' and data.get('data'):
+            for row in data['data']:
+                try:
+                    inst_map[row[0].strip()] = {
+                        'name': row[1].strip(),
+                        'foreign': int(row[4].replace(',', '')),
+                        'trust': int(row[10].replace(',', '')),
+                        'total': int(row[18].replace(',', '')),
+                    }
+                except (ValueError, IndexError):
+                    continue
+            break
     return inst_map
 
 @app.route('/api/value_picks')
@@ -3176,6 +3296,11 @@ def portfolio_signals():
         if s and s.get('code'):
             rt_map[s['code']] = s
 
+    # Fundamentals for the per-holding Buffett value health check (all cached)
+    pf_fund_map = _fetch_pe_pb_yield()
+    pf_rev_map = _fetch_revenue_growth()
+    pf_fundamentals = _fetch_fundamentals()
+
     def calc_rsi(closes, period=14):
         return _wilder_rsi(closes, period)
 
@@ -3337,6 +3462,14 @@ def portfolio_signals():
                 action, action_label = 'neutral', '🤔 可小量試單'
                 action_desc = '盤整中，可小量佈局等待方向確認'
 
+            # Buffett value health for this holding
+            _f = pf_fund_map.get(code, {})
+            _bb = buffett_score(pf_fundamentals.get(code, {}), _f.get('pe'), _f.get('pb'),
+                                _f.get('yield'), pf_rev_map.get(code, {}).get('yoy'), price)
+            value_score = _bb.get('score') if _bb.get('available') else None
+            value_verdict = _bb.get('verdict') if _bb.get('available') else None
+            value_icon = _bb.get('verdict_icon') if _bb.get('available') else None
+
             return {
                 'code': code, 'name': name, 'market': market,
                 'price': price, 'change': change, 'change_pct': change_pct,
@@ -3352,6 +3485,8 @@ def portfolio_signals():
                 'ma5': round(ma5, 2), 'ma20': round(ma20, 2),
                 'ma60': round(ma60, 2) if ma60 else None,
                 'spark': [round(c, 2) for c in closes[-30:]],
+                'value_score': value_score, 'value_verdict': value_verdict,
+                'value_icon': value_icon, 'roe': _bb.get('roe'),
             }
         except Exception:
             return None
@@ -3759,37 +3894,52 @@ def stock_signal():
             fund_signals.append({'type': '營收下滑', 'icon': '📉', 'desc': f'營收年減 {yoy:.1f}%', 'weight': -1, 'bullish': False, 'cat': 'fundamental'})
 
     # ── 🎩 Buffett value-investing view (財報品質 + 估值 + 安全邊際) ──
-    buffett = buffett_score(_fetch_fundamentals().get(code, {}), pe, pb, dy, yoy, price)
+    _fund_metrics = _fetch_fundamentals().get(code, {})
+    buffett = buffett_score(_fund_metrics, pe, pb, dy, yoy, price)
+    # 存股 (income / dividend) track record
+    dividend_quality = _dividend_quality(code, market, price, _fund_metrics.get('eps_annual'))
 
     # ═══════════════════════════════════════════
     # PART 3: Institutional / Chip analysis (籌碼面)
     # ═══════════════════════════════════════════
     chip_signals = []
-    inst_map = _fetch_institutional()
-    inst = inst_map.get(code)
+    inst = None  # derived from the latest chip day below (avoids a 2nd full-market T86 download)
     chip_data = None
     try:
-        # Fetch chip analysis data (consecutive buying)
+        # Fetch chip analysis data (consecutive buying) — 6 days fetched in
+        # parallel (each T86 call is large), then processed newest-first.
         today = datetime.date.today()
-        chip_daily = []
-        for dd in range(10):
-            chip_day = today - datetime.timedelta(days=dd)
-            if chip_day.weekday() >= 5:
-                continue
+        days = [d for d in (today - datetime.timedelta(days=dd) for dd in range(6)) if d.weekday() < 5]
+
+        def _fetch_t86(d):
             try:
-                date_str = f'{chip_day.year - 1911}/{chip_day.month:02d}/{chip_day.day:02d}'
-                t86_url = f'https://www.twse.com.tw/fund/T86?response=json&date={chip_day.strftime("%Y%m%d")}&selectType=ALL'
-                t86_data = cached_get(t86_url, ttl=3600)
-                for row in t86_data.get('data', []):
-                    if row[0].strip() == code:
+                url = f'https://www.twse.com.tw/fund/T86?response=json&date={d.strftime("%Y%m%d")}&selectType=ALL'
+                return d, cached_get(url, ttl=3600)
+            except Exception:
+                return d, None
+
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            t86_results = list(pool.map(_fetch_t86, days))
+
+        chip_daily = []
+        for chip_day, t86_data in t86_results:  # already newest-first
+            if not isinstance(t86_data, dict):
+                continue
+            for row in t86_data.get('data', []):
+                if row[0].strip() == code:
+                    try:
                         foreign = int(row[4].replace(',', ''))
                         trust = int(row[10].replace(',', ''))
                         total = int(row[18].replace(',', ''))
                         chip_daily.append({'date': chip_day.strftime('%m/%d'), 'foreign': foreign // 1000,
                                            'trust': trust // 1000, 'total': total // 1000})
-                        break
-            except Exception:
-                continue
+                        # Latest day → institutional snapshot (raw shares)
+                        if inst is None:
+                            inst = {'name': name, 'foreign': foreign, 'trust': trust, 'total': total}
+                    except (ValueError, IndexError):
+                        pass
+                    break
         # Count consecutive buy days
         consec_buy = 0
         for cd in chip_daily:
@@ -3956,6 +4106,8 @@ def stock_signal():
         'news': news,
         # 🎩 Buffett value-investing analysis
         'buffett': buffett,
+        # 💰 存股 / dividend track record
+        'dividend_quality': dividend_quality,
     })
 
 @app.route('/api/network_info')

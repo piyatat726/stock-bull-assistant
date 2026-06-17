@@ -1102,9 +1102,12 @@ function renderPF(){
   const mul=pUnit==='lot'?1000:1;
   const placeholder=pUnit==='stock'?'如 500':'如 1';
   const qtyLb=pUnit==='stock'?'股數':'張數';
-  let tc=0,tv=0,tdp=0,nUp=0,nDn=0,nBuy=0,nTgt=0,nStop=0;
+  let tc=0,tv=0,tdp=0,nUp=0,nDn=0,nBuy=0,nTgt=0,nStop=0,nGood=0,nWeak=0,vScoreSum=0,vScoreN=0;
 
   const cards=pfData.map(s=>{
+    if(s.value_icon==='🎩'||s.value_icon==='🟢')nGood++;
+    else if(s.value_icon==='🔴')nWeak++;
+    if(s.value_score!=null){vScoreSum+=s.value_score;vScoreN++;}
     const p=pd[s.code]||{cost:'',qty:''};
     const cost=parseFloat(p.cost)||0,qty=parseFloat(p.qty)||0;
     const shares=qty*mul;
@@ -1162,6 +1165,7 @@ function renderPF(){
           <div class="pf-name">${s.name} <span class="pf-code">${s.code} · ${s.market==='tse'?'上市':'上櫃'}</span></div>
           <div class="pf-badges">
             <span class="pf-trend ${tCls}">${tIcon} ${s.trend_label}</span>
+            ${s.value_verdict?(()=>{const vc={'🎩':'var(--green)','🟢':'var(--green)','🟡':'var(--gold)','🔴':'var(--red)','⚪':'var(--dim)'}[s.value_icon]||'var(--dim)';return`<span class="pf-trend" style="background:${vc}1f;color:${vc};border:1px solid ${vc}55">${s.value_icon} ${s.value_verdict}${s.value_score!=null?' '+s.value_score:''}</span>`;})():''}
             ${pfSpark(s.spark,sparkColor)}
           </div>
           <div class="pf-trend-desc" style="margin-top:6px">${s.trend_desc}</div>
@@ -1185,17 +1189,22 @@ function renderPF(){
 
   // ── Summary strip ──
   const tp=tv-tc,tpct=tc>0?(tp/tc*100):0;
+  const avgV=vScoreN?Math.round(vScoreSum/vScoreN):null;
+  const avgC=avgV==null?'var(--dim)':avgV>=65?'var(--green)':avgV>=45?'var(--gold)':'var(--red)';
   $('pf-summary').innerHTML=`
     <div class="pf-sum-card"><div class="sl">今日持股表現</div><div class="sv"><span class="up">${nUp} 漲</span> <span style="color:var(--dim);font-size:13px">/</span> <span class="down">${nDn} 跌</span></div></div>
     <div class="pf-sum-card"><div class="sl">今日損益</div><div class="sv ${cc(tdp)}">${tc>0?(tdp>0?'+':'')+Math.round(tdp).toLocaleString():'-'}</div></div>
     <div class="pf-sum-card"><div class="sl">總損益</div><div class="sv ${cc(tp)}">${tc>0?(tp>0?'+':'')+Math.round(tp).toLocaleString():'-'}</div></div>
-    <div class="pf-sum-card"><div class="sl">總報酬率</div><div class="sv ${cc(tp)}">${tc>0?(tpct>=0?'+':'')+tpct.toFixed(2)+'%':'-'}</div></div>`;
+    <div class="pf-sum-card"><div class="sl">總報酬率</div><div class="sv ${cc(tp)}">${tc>0?(tpct>=0?'+':'')+tpct.toFixed(2)+'%':'-'}</div></div>
+    <div class="pf-sum-card"><div class="sl">🎩 組合體質</div><div class="sv" style="color:${avgC}">${avgV==null?'-':avgV+'分'}</div></div>`;
 
   // ── Smart hints ──
   const hints=[];
   if(nBuy)hints.push(`✅ <b>${nBuy} 檔</b>在可進場區間`);
   if(nTgt)hints.push(`🎯 <b>${nTgt} 檔</b>接近或已達目標價`);
   if(nStop)hints.push(`🛑 <b>${nStop} 檔</b>跌破停損參考，優先檢視`);
+  if(nGood)hints.push(`🎩 <b>${nGood} 檔</b>巴菲特評為好公司`);
+  if(nWeak)hints.push(`⚠️ <b>${nWeak} 檔</b>體質偏弱，建議檢視`);
   $('pf-hint').innerHTML=hints.length?`<div class="pf-hint">💡 ${hints.join(' · ')}</div>`:'';
 }
 function upP(code,field,val){const d=getP();if(!d[code])d[code]={};d[code][field]=val;setP(d);renderPF()}
@@ -2288,6 +2297,34 @@ async function querySignal(){
       </div>`;
     }
 
+    // 💰 存股 / dividend track record
+    let dividendHtml='';
+    if(s.dividend_quality){
+      const q=s.dividend_quality;
+      const dvc={'🏆':'#10b981','💰':'#10b981','📅':'#f5b731','🟡':'#f5b731','⚪':'#6b7fa3','⚠️':'#f97316'}[q.verdict_icon]||'#6b7fa3';
+      const chips=[];
+      chips.push(`連續配息 <b>${q.consecutive_years}</b> 年`);
+      if(q.yield!=null)chips.push(`殖利率 <b>${q.yield}%</b>`);
+      if(q.payout_ratio!=null)chips.push(`配息率 <b>${q.payout_ratio}%</b>`);
+      if(q.ttm_dividend!=null)chips.push(`近一年配 <b>${q.ttm_dividend}</b> 元`);
+      const trendTxt={'growing':'📈 股利成長','shrinking':'📉 股利縮水','stable':'➡️ 配息平穩'}[q.trend]||'';
+      const notesHtml=(q.notes||[]).map(n=>`<div style="font-size:11px;margin:2px 0;color:var(--dim)">• ${n}</div>`).join('');
+      dividendHtml=`<div style="margin:10px 0;padding:12px;background:${dvc}0e;border:1px solid ${dvc}40;border-radius:10px">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+          <div style="font-size:13px;font-weight:800">💰 存股評估</div>
+          <div style="font-size:10px;color:var(--dim)">配息領息角度</div>
+          <div style="margin-left:auto;font-size:18px;font-weight:800;color:${dvc}">${q.score}<span style="font-size:11px;color:var(--dim)">/100</span></div>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+          <div style="font-size:20px">${q.verdict_icon}</div>
+          <div><div style="font-size:15px;font-weight:800;color:${dvc}">${q.verdict}</div>
+          <div style="font-size:11px;color:var(--dim)">${q.verdict_desc}</div></div>
+        </div>
+        <div style="font-size:11px;margin:6px 0;line-height:1.9">${chips.join(' · ')}${trendTxt?' · '+trendTxt:''}</div>
+        ${notesHtml}
+      </div>`;
+    }
+
     el.innerHTML=`<div class="sig-card" style="border-left:4px solid ${vc}">
       <div class="sig-head">
         <div>
@@ -2313,6 +2350,7 @@ async function querySignal(){
       </div>
 
       ${buffettHtml}
+      ${dividendHtml}
 
       <div style="padding:8px 4px;margin:6px 0">
         ${scoreBar('技術面','📈',s.tech_score||0,10)}
