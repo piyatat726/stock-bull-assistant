@@ -485,6 +485,10 @@ body *{transition:background-color var(--transition-speed) ease,border-color var
 <div class="main">
 
 <div class="page active" id="page-overview">
+  <div id="tech-section" style="display:none;margin-bottom:16px">
+    <div class="stitle" style="color:var(--blue)">🤖 AI／科技股精選 <span style="font-size:11px;color:var(--dim);font-weight:400">半導體・AI 伺服器・網通 · 法人動向＋營收成長排名 · 僅供參考</span></div>
+    <div id="tech-grid"><div class="loading"><span class="spin">↻</span> 分析中...</div></div>
+  </div>
   <div id="va-section" style="display:none;margin-bottom:16px">
     <div class="stitle" style="color:var(--green)">🎯 估值雷達 <span style="font-size:11px;color:var(--dim);font-weight:400">好公司跌進便宜區（低於合理價）· 進入時自動通知 · 僅供參考</span> <button class="hbtn" id="va-notify-btn" onclick="enableValueAlertPush()" style="font-size:10px;padding:3px 8px;margin-left:4px">🔔 開啟通知</button></div>
     <div id="va-grid"></div>
@@ -1693,6 +1697,25 @@ function updateVANotifyBtn(){
   b.textContent=granted?'🔔 通知已開':'🔔 開啟通知';
   b.style.opacity=granted?'.6':'1';
 }
+async function loadTechPicks(){
+  try{
+    const r=await fetch('/api/tech_picks');const data=await r.json();
+    if(!data.length){$('tech-section').style.display='none';return}
+    $('tech-section').style.display='block';
+    $('tech-grid').innerHTML='<div class="grid g4" style="display:grid;gap:10px">'+data.slice(0,12).map(s=>{
+      const c=cc(s.change);
+      const strong=s.score>=5;
+      return`<div class="np-card" style="border-left:3px solid ${strong?'var(--blue)':'var(--border)'}">
+        <div class="np-head"><div><div class="nm">${s.name}</div><div class="cd">${s.code} · ${s.market==='tse'?'上市':'上櫃'}</div></div><div class="pr ${c}">${s.price}</div></div>
+        <div style="display:flex;align-items:center;gap:6px;margin:6px 0;flex-wrap:wrap">
+          <span class="ctag ${c}">${sg(s.change_pct)}${s.change_pct}%</span>
+          <span style="font-size:10px;padding:2px 6px;border-radius:4px;background:rgba(59,130,246,.12);color:var(--blue);font-weight:700">強度 ${s.score}</span>
+        </div>
+        ${s.reasons&&s.reasons.length?`<div style="font-size:10.5px;line-height:1.6">${s.reasons.map(p=>'• '+p).join('<br>')}</div>`:''}
+      </div>`}).join('')+'</div>';
+  }catch(e){$('tech-section').style.display='none'}
+}
+
 async function loadValueAlerts(){
   try{
     const r=await fetch('/api/value_alerts');const data=await r.json();
@@ -2610,7 +2633,7 @@ setInterval(checkPriceAlerts,15000);
 function refreshAll(){
   countdown=30;
   $('refresh-btn').classList.add('spin');
-  Promise.all([loadIndex(),loadWL(),loadMovers(),loadVolRank(),loadRecommend(),loadSellRecommend(),loadNewsPicks(),loadValuePicks(),loadValueAlerts(),loadGlobal(),loadDailySummary()])
+  Promise.all([loadIndex(),loadWL(),loadMovers(),loadVolRank(),loadTechPicks(),loadRecommend(),loadSellRecommend(),loadNewsPicks(),loadValuePicks(),loadValueAlerts(),loadGlobal(),loadDailySummary()])
     .finally(()=>setTimeout(()=>$('refresh-btn').classList.remove('spin'),800));
 }
 

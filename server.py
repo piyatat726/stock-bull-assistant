@@ -37,6 +37,20 @@ POPULAR_OTC = ['6788','3105','6547','5765','4966','3293','6510','8069','6679','5
                '6426','3529','6180','8044','4763','6770','5289','6592','3707','6781']
 POPULAR_ETF = [('0050','tse'),('0056','tse'),('00878','tse'),('00919','tse'),
                ('00929','tse'),('006208','tse'),('00713','tse'),('00940','tse')]
+# AI / 科技股 universe for 科技股精選 (semiconductors, AI servers, networking, components)
+TECH_AI = [
+    # 半導體 / IC 設計
+    ('2330','tse'),('2454','tse'),('2303','tse'),('3711','tse'),('2379','tse'),
+    ('3034','tse'),('3443','tse'),('3661','tse'),('5269','tse'),('6415','tse'),
+    ('2408','tse'),('2344','tse'),('3035','tse'),('8299','otc'),('4966','otc'),
+    ('5347','otc'),('5274','otc'),('6531','otc'),('6770','otc'),
+    # AI 伺服器 / 代工 / 散熱
+    ('2317','tse'),('2382','tse'),('3231','tse'),('6669','tse'),('2356','tse'),
+    ('4938','tse'),('2376','tse'),('2357','tse'),('3017','tse'),('3324','tse'),
+    ('2301','tse'),
+    # 網通 / PCB / 光學
+    ('2345','tse'),('3037','tse'),('8046','tse'),('3008','tse'),
+]
 
 # Chinese name mapping — loaded from stock_names.json (11K+ stocks)
 # Falls back to hardcoded popular stocks if file is missing
@@ -1032,6 +1046,9 @@ NEGATIVE_KW = ['跌','下跌','利空','看空','砍','下修','衰退','虧損'
 
 @app.route('/api/news_picks')
 def news_picks():
+    return jsonify(_compute_news_picks())
+
+def _compute_news_picks():
     # Diverse queries surface more than just the daily mega-cap headlines
     queries = ['台股 漲停 個股', '法人 買超 個股', '營收 創新高 個股',
                '台股 強勢 飆股', '外資 買超 股票', '台股 利多 題材', '半導體 股票 漲']
@@ -1085,7 +1102,7 @@ def news_picks():
                 })
 
     if not picks:
-        return jsonify([])
+        return []
 
     codes = list(picks.keys())
     otc_codes = set(POPULAR_OTC)
@@ -1121,7 +1138,7 @@ def news_picks():
 
     # Rank by blended hotness (fresh + positive + rising), not raw keyword count
     results.sort(key=lambda x: x['hot'], reverse=True)
-    return jsonify(results[:8])
+    return results[:8]
 
 @app.route('/api/news')
 def news():
@@ -1751,6 +1768,73 @@ def _fetch_institutional():
             break
     return inst_map
 
+def _compute_tech_picks():
+    """AI/科技股精選: rank a curated tech universe (semis, AI servers,
+    networking, components) by institutional buying + revenue growth + quality
+    (ROE/margin) + today's momentum. Growth/momentum-oriented, not value."""
+    inst_map = _fetch_institutional()
+    rev_map = _fetch_revenue_growth()
+    fundamentals = _fetch_fundamentals()
+    stocks = fetch_stocks(TECH_AI)
+    seen = set()
+    picks = []
+    for s in stocks:
+        code = s['code']
+        if code in seen or not s.get('price'):
+            continue
+        seen.add(code)
+        chg = s.get('change_pct', 0) or 0
+        inst = inst_map.get(code)
+        total_net = (inst.get('total', 0) // 1000) if inst else 0   # 張
+        foreign_net = (inst.get('foreign', 0) // 1000) if inst else 0
+        yoy = rev_map.get(code, {}).get('yoy')
+        f = fundamentals.get(code, {})
+        roe = f.get('roe')
+        gm = f.get('gross_margin')
+        score = 0.0
+        reasons = []
+        if total_net >= 3000:
+            score += 3; reasons.append(f'法人大買 {total_net:,} 張')
+        elif total_net >= 500:
+            score += 2; reasons.append(f'法人買超 {total_net:,} 張')
+        elif total_net <= -3000:
+            score -= 2; reasons.append(f'法人大賣 {abs(total_net):,} 張')
+        if yoy is not None:
+            if yoy >= 30:
+                score += 3; reasons.append(f'營收年增 {yoy:+.0f}%')
+            elif yoy >= 15:
+                score += 2; reasons.append(f'營收年增 {yoy:+.0f}%')
+            elif yoy >= 5:
+                score += 1
+            elif yoy < 0:
+                score -= 1
+        if roe is not None and roe >= 20:
+            score += 1.5; reasons.append(f'ROE {roe:.0f}%')
+        elif roe is not None and roe >= 12:
+            score += 1
+        if gm is not None and gm >= 40 and len(reasons) < 3:
+            reasons.append(f'毛利率 {gm:.0f}%')
+        if 0 < chg <= 6:
+            score += 1
+        elif chg > 6:
+            score += 0.5; reasons.append('今日強漲')
+        elif chg < -3:
+            score -= 1
+        picks.append({
+            'code': code, 'name': s['name'], 'price': s['price'],
+            'change': s.get('change', 0), 'change_pct': chg,
+            'market': s.get('market', 'tse'),
+            'score': round(score, 1), 'reasons': reasons[:3],
+            'foreign_net': foreign_net, 'total_net': total_net,
+            'rev_yoy': round(yoy, 1) if yoy is not None else None, 'roe': roe,
+        })
+    picks.sort(key=lambda x: (x['score'], x['total_net']), reverse=True)
+    return picks[:12]
+
+@app.route('/api/tech_picks')
+def tech_picks():
+    return jsonify(_compute_tech_picks())
+
 @app.route('/api/value_picks')
 def value_picks():
     """Buffett value-investing leaderboard: rank stocks by the value scorecard
@@ -1837,37 +1921,13 @@ def value_alerts():
         threshold = 8.0
     return jsonify(_scan_value_alerts(threshold))
 
-@app.route('/api/scan_and_push')
-def scan_and_push():
-    """Scheduled (Vercel Cron) endpoint: scan for cheap good stocks and push to
-    LINE. Auth: Vercel injects `Authorization: Bearer $CRON_SECRET` when the
-    CRON_SECRET env var is set; we also accept ?key=<CRON_SECRET>. Pushes via
-    LINE Messaging API using LINE_CHANNEL_TOKEN (broadcast, or push to LINE_TO)."""
-    secret = os.environ.get('CRON_SECRET', '')
-    if secret:
-        auth = request.headers.get('Authorization', '')
-        if auth != f'Bearer {secret}' and request.args.get('key', '') != secret:
-            return jsonify({'error': 'unauthorized'}), 401
-    try:
-        threshold = float(request.args.get('mos', '8'))
-    except ValueError:
-        threshold = 8.0
-    alerts = _scan_value_alerts(threshold)
-    if not alerts:
-        return jsonify({'pushed': False, 'reason': 'no cheap good stocks', 'count': 0})
-
-    today = datetime.date.today().strftime('%m/%d')
-    lines = ['🎯 估值雷達：好公司進入便宜區', f'（{today} 盤後）', '']
-    for a in alerts[:8]:
-        lines.append(f"・{a['name']}({a['code']})　低估 {a['margin_of_safety']}%")
-        lines.append(f"　現價 {a['price']} / 合理價 {a['fair_price']}　ROE {a.get('roe') if a.get('roe') is not None else '-'}%")
-    lines += ['', '※ 僅供參考，不構成投資建議']
-    msg = '\n'.join(lines)
-
+def _line_push(msg, count):
+    """Send a text message to LINE (broadcast, or push to LINE_TO). Returns a
+    JSON-able status dict. If no token is set, returns a preview instead."""
     token = os.environ.get('LINE_CHANNEL_TOKEN', '')
     if not token:
-        return jsonify({'pushed': False, 'reason': 'LINE_CHANNEL_TOKEN not set',
-                        'count': len(alerts), 'preview': msg})
+        return {'pushed': False, 'reason': 'LINE_CHANNEL_TOKEN not set',
+                'count': count, 'preview': msg}
     try:
         to = os.environ.get('LINE_TO', '')
         if to:
@@ -1879,10 +1939,63 @@ def scan_and_push():
         r = requests.post(url, headers={'Authorization': f'Bearer {token}',
                                         'Content-Type': 'application/json'},
                           json=payload, timeout=10)
-        return jsonify({'pushed': r.status_code == 200, 'http': r.status_code,
-                        'count': len(alerts), 'resp': r.text[:200]})
+        return {'pushed': r.status_code == 200, 'http': r.status_code,
+                'count': count, 'resp': r.text[:200]}
     except Exception as e:
-        return jsonify({'pushed': False, 'error': str(e), 'count': len(alerts)})
+        return {'pushed': False, 'error': str(e), 'count': count}
+
+@app.route('/api/scan_and_push')
+def scan_and_push():
+    """Scheduled (Vercel Cron) endpoint: push 🤖 AI/科技股精選 + 📰 新聞選股 to
+    LINE. Auth: Vercel injects `Authorization: Bearer $CRON_SECRET` when the env
+    var is set; we also accept ?key=<CRON_SECRET>. `mode` query selects content
+    (tech_news default / value)."""
+    secret = os.environ.get('CRON_SECRET', '')
+    if secret:
+        auth = request.headers.get('Authorization', '')
+        if auth != f'Bearer {secret}' and request.args.get('key', '') != secret:
+            return jsonify({'error': 'unauthorized'}), 401
+
+    mode = request.args.get('mode', 'tech_news')
+    today = datetime.date.today().strftime('%m/%d')
+
+    if mode == 'value':
+        try:
+            threshold = float(request.args.get('mos', '8'))
+        except ValueError:
+            threshold = 8.0
+        alerts = _scan_value_alerts(threshold)
+        if not alerts:
+            return jsonify({'pushed': False, 'reason': 'no cheap good stocks', 'count': 0})
+        lines = ['🎯 估值雷達：好公司進入便宜區', f'（{today} 盤後）', '']
+        for a in alerts[:8]:
+            lines.append(f"・{a['name']}({a['code']})　低估 {a['margin_of_safety']}%")
+            lines.append(f"　現價 {a['price']} / 合理價 {a['fair_price']}")
+        lines += ['', '※ 僅供參考，不構成投資建議']
+        return jsonify(_line_push('\n'.join(lines), len(alerts)))
+
+    # Default: AI/科技股精選 + 新聞選股
+    tech = _compute_tech_picks()
+    news = _compute_news_picks()
+    tech_strong = [t for t in tech if t['score'] >= 2][:6] or tech[:5]
+    sections = []
+    if tech_strong:
+        block = ['🤖 今日 AI/科技股精選']
+        for t in tech_strong:
+            tag = '｜'.join(t['reasons'][:2]) if t.get('reasons') else ''
+            block.append(f"・{t['name']}({t['code']})　{t['change_pct']:+.1f}%" + (f"\n　{tag}" if tag else ''))
+        sections.append('\n'.join(block))
+    if news:
+        block = ['📰 新聞熱門選股']
+        for n in news[:5]:
+            block.append(f"・{n['name']}({n['code']})　{n['change_pct']:+.1f}%　新聞提及 {n['score']} 次")
+        sections.append('\n'.join(block))
+
+    if not sections:
+        return jsonify({'pushed': False, 'reason': 'no picks today', 'count': 0})
+
+    msg = f'📈 台股盤後精選（{today}）\n\n' + '\n\n'.join(sections) + '\n\n※ 僅供參考，不構成投資建議'
+    return jsonify(_line_push(msg, len(tech_strong) + len(news[:5])))
 
 @app.route('/api/recommend')
 def recommend():
