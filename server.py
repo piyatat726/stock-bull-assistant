@@ -2055,13 +2055,23 @@ def scan_and_push():
         lines += ['', '※ 僅供參考，不構成投資建議']
         return jsonify(_line_push('\n'.join(lines), len(alerts)))
 
-    # Default: AI/科技股精選 + 新聞選股
+    # Default: 技術面進場訊號 + AI/科技股精選 + 新聞選股
+    sigs = _compute_entry_signals()
     tech = _compute_tech_picks()
     news = _compute_news_picks()
-    tech_strong = [t for t in tech if t['score'] >= 2][:6] or tech[:5]
+    sig_strong = [s for s in sigs if s.get('total_weight', 0) >= 7][:5]
+    tech_strong = [t for t in tech if t['score'] >= 2][:5] or tech[:4]
     sections = []
+    if sig_strong:
+        block = ['📊 技術面進場訊號']
+        for s in sig_strong:
+            tags = '、'.join(sig['type'] for sig in s.get('signals', [])[:2])
+            block.append(f"・{s['name']}({s['code']})　{s['change_pct']:+.1f}%"
+                         f"\n　進場 {s['entry']}｜停損 {s['stop_loss']}｜目標 {s['target']}"
+                         + (f"\n　{tags}" if tags else ''))
+        sections.append('\n'.join(block))
     if tech_strong:
-        block = ['🤖 今日 AI/科技股精選']
+        block = ['🤖 AI/科技股精選']
         for t in tech_strong:
             tag = '｜'.join(t['reasons'][:2]) if t.get('reasons') else ''
             block.append(f"・{t['name']}({t['code']})　{t['change_pct']:+.1f}%" + (f"\n　{tag}" if tag else ''))
@@ -2076,7 +2086,7 @@ def scan_and_push():
         return jsonify({'pushed': False, 'reason': 'no picks today', 'count': 0})
 
     msg = f'📈 台股盤後精選（{today}）\n\n' + '\n\n'.join(sections) + '\n\n※ 僅供參考，不構成投資建議'
-    return jsonify(_line_push(msg, len(tech_strong) + len(news[:5])))
+    return jsonify(_line_push(msg, len(sig_strong) + len(tech_strong) + len(news[:5])))
 
 @app.route('/api/recommend')
 def recommend():
@@ -3251,6 +3261,9 @@ def stock_news():
 
 @app.route('/api/entry_signals')
 def entry_signals():
+    return jsonify(_compute_entry_signals())
+
+def _compute_entry_signals():
     """Scan popular stocks for technical entry signals (RSI, KD, MACD, MA, Bollinger)"""
     import math
 
@@ -3560,7 +3573,7 @@ def entry_signals():
 
     # Sort by total weight (signal strength)
     results.sort(key=lambda x: x['total_weight'], reverse=True)
-    return jsonify(results[:20])
+    return results[:20]
 
 @app.route('/api/portfolio_signals')
 def portfolio_signals():
