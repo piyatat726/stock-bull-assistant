@@ -2059,7 +2059,7 @@ def scan_and_push():
     sigs = _compute_entry_signals()
     tech = _compute_tech_picks()
     news = _compute_news_picks()
-    sig_strong = [s for s in sigs if s.get('total_weight', 0) >= 7][:5]
+    sig_strong = [s for s in sigs if s.get('total_weight', 0) >= 8][:5]
     tech_strong = [t for t in tech if t['score'] >= 2][:5] or tech[:4]
     sections = []
     if sig_strong:
