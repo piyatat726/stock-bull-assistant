@@ -1978,9 +1978,19 @@ def tv_webhook():
     strat = str(g('strategy', 'comment', 'name')).strip()
     note = str(g('note', 'message', 'text')).strip()
 
-    is_close = ('close' in action or 'exit' in action or 'flat' in action or action == 'cover')
-    is_buy = (action in ('buy', 'long') or action.startswith('long') or action == 'buy_entry')
-    is_sell = (action in ('sell', 'short') or action.startswith('short') or action == 'sell_entry')
+    # TradingView strategy alerts send the resulting position; use it to tell
+    # entry vs exit reliably (a strategy "sell" can be a short entry OR a long exit).
+    mpos = str(g('position', 'market_position')).lower().strip()
+    if mpos in ('flat', '0'):
+        is_close, is_buy, is_sell = True, False, False
+    elif mpos == 'long':
+        is_close, is_buy, is_sell = False, True, False
+    elif mpos == 'short':
+        is_close, is_buy, is_sell = False, False, True
+    else:
+        is_close = ('close' in action or 'exit' in action or 'flat' in action or action == 'cover')
+        is_buy = (action in ('buy', 'long') or action.startswith('long') or action == 'buy_entry')
+        is_sell = (action in ('sell', 'short') or action.startswith('short') or action == 'sell_entry')
 
     if is_close:
         head = '📤 出場訊號（模擬）'
