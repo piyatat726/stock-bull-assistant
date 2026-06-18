@@ -5,5 +5,8 @@
   "routes": [
     { "src": "/static/(.*)", "dest": "/static/$1" },
     { "src": "/(.*)", "dest": "/server.py" }
+  ],
+  "crons": [
+    { "path": "/api/scan_and_push", "schedule": "30 6 * * 1-5" }
   ]
 }

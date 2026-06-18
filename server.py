@@ -1791,15 +1791,10 @@ def value_picks():
     results.sort(key=_rank, reverse=True)
     return jsonify(results[:15])
 
-@app.route('/api/value_alerts')
-def value_alerts():
-    """估值雷達: good companies (high-quality Buffett verdict) that have dropped
-    into the cheap zone — trading at least `mos`% below their reference fair
-    value. This is the trigger source for "好公司跌進便宜區" notifications."""
-    try:
-        threshold = float(request.args.get('mos', '8'))
-    except ValueError:
-        threshold = 8.0
+def _scan_value_alerts(threshold=8.0):
+    """好公司跌進便宜區: high-quality (🎩/🟢, non-cyclical) stocks trading at
+    least `threshold`% below reference fair value. Shared by the 估值雷達 UI
+    endpoint and the scheduled LINE-push endpoint."""
     fund_map = _fetch_pe_pb_yield()
     rev_map = _fetch_revenue_growth()
     fundamentals = _fetch_fundamentals()
@@ -1819,8 +1814,6 @@ def value_alerts():
         if not b.get('available') or b.get('limited'):
             continue
         mos = b.get('margin_of_safety')
-        # Cheap zone = quality company (🎩/🟢 verdict) trading >= threshold below
-        # fair value, excluding cyclical-peak traps.
         if (b['verdict_icon'] in ('🎩', '🟢') and mos is not None
                 and mos >= threshold and '景氣循環' not in b['verdict']):
             alerts.append({
@@ -1833,7 +1826,63 @@ def value_alerts():
                 'pros': b['pros'][:2],
             })
     alerts.sort(key=lambda x: x['margin_of_safety'], reverse=True)
-    return jsonify(alerts)
+    return alerts
+
+@app.route('/api/value_alerts')
+def value_alerts():
+    """估值雷達 — good companies that dropped into the cheap zone (UI source)."""
+    try:
+        threshold = float(request.args.get('mos', '8'))
+    except ValueError:
+        threshold = 8.0
+    return jsonify(_scan_value_alerts(threshold))
+
+@app.route('/api/scan_and_push')
+def scan_and_push():
+    """Scheduled (Vercel Cron) endpoint: scan for cheap good stocks and push to
+    LINE. Auth: Vercel injects `Authorization: Bearer $CRON_SECRET` when the
+    CRON_SECRET env var is set; we also accept ?key=<CRON_SECRET>. Pushes via
+    LINE Messaging API using LINE_CHANNEL_TOKEN (broadcast, or push to LINE_TO)."""
+    secret = os.environ.get('CRON_SECRET', '')
+    if secret:
+        auth = request.headers.get('Authorization', '')
+        if auth != f'Bearer {secret}' and request.args.get('key', '') != secret:
+            return jsonify({'error': 'unauthorized'}), 401
+    try:
+        threshold = float(request.args.get('mos', '8'))
+    except ValueError:
+        threshold = 8.0
+    alerts = _scan_value_alerts(threshold)
+    if not alerts:
+        return jsonify({'pushed': False, 'reason': 'no cheap good stocks', 'count': 0})
+
+    today = datetime.date.today().strftime('%m/%d')
+    lines = ['🎯 估值雷達：好公司進入便宜區', f'（{today} 盤後）', '']
+    for a in alerts[:8]:
+        lines.append(f"・{a['name']}({a['code']})　低估 {a['margin_of_safety']}%")
+        lines.append(f"　現價 {a['price']} / 合理價 {a['fair_price']}　ROE {a.get('roe') if a.get('roe') is not None else '-'}%")
+    lines += ['', '※ 僅供參考，不構成投資建議']
+    msg = '\n'.join(lines)
+
+    token = os.environ.get('LINE_CHANNEL_TOKEN', '')
+    if not token:
+        return jsonify({'pushed': False, 'reason': 'LINE_CHANNEL_TOKEN not set',
+                        'count': len(alerts), 'preview': msg})
+    try:
+        to = os.environ.get('LINE_TO', '')
+        if to:
+            url = 'https://api.line.me/v2/bot/message/push'
+            payload = {'to': to, 'messages': [{'type': 'text', 'text': msg}]}
+        else:
+            url = 'https://api.line.me/v2/bot/message/broadcast'
+            payload = {'messages': [{'type': 'text', 'text': msg}]}
+        r = requests.post(url, headers={'Authorization': f'Bearer {token}',
+                                        'Content-Type': 'application/json'},
+                          json=payload, timeout=10)
+        return jsonify({'pushed': r.status_code == 200, 'http': r.status_code,
+                        'count': len(alerts), 'resp': r.text[:200]})
+    except Exception as e:
+        return jsonify({'pushed': False, 'error': str(e), 'count': len(alerts)})
 
 @app.route('/api/recommend')
 def recommend():
