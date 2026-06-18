@@ -1944,6 +1944,77 @@ def _line_push(msg, count):
     except Exception as e:
         return {'pushed': False, 'error': str(e), 'count': count}
 
+# Best-effort recent TradingView signals (in-memory; resets on cold start)
+_tv_recent = []
+
+@app.route('/api/tv_webhook', methods=['POST', 'GET'])
+def tv_webhook():
+    """Receive a TradingView strategy alert (JSON) and push a PAPER-TRADE
+    notification to LINE. SAFE — never places a real order. Secret-guarded via
+    the TV_SECRET env var (passed as JSON 'secret' or ?key=)."""
+    payload = request.get_json(force=True, silent=True) or {}
+    if not payload and request.args:
+        payload = dict(request.args)
+
+    secret = os.environ.get('TV_SECRET', '')
+    if secret:
+        got = str(payload.get('secret', '')) or request.args.get('key', '')
+        if got != secret:
+            return jsonify({'error': 'unauthorized'}), 401
+
+    def g(*keys):
+        for k in keys:
+            v = payload.get(k)
+            if v not in (None, ''):
+                return v
+        return ''
+    action = str(g('action', 'side', 'order')).lower().strip()
+    symbol = str(g('symbol', 'ticker') or '?').strip()
+    price = g('price', 'close')
+    sl = g('sl', 'stop', 'stoploss')
+    tp = g('tp', 'target', 'takeprofit')
+    qty = g('qty', 'contracts', 'size', 'position')
+    pnl = g('pnl', 'profit')
+    strat = str(g('strategy', 'comment', 'name')).strip()
+    note = str(g('note', 'message', 'text')).strip()
+
+    is_close = ('close' in action or 'exit' in action or 'flat' in action or action == 'cover')
+    is_buy = (action in ('buy', 'long') or action.startswith('long') or action == 'buy_entry')
+    is_sell = (action in ('sell', 'short') or action.startswith('short') or action == 'sell_entry')
+
+    if is_close:
+        head = '📤 出場訊號（模擬）'
+        body = [f'策略：{strat}' if strat else '',
+                f'{symbol} 平倉' + (f' @ {price}' if price != '' else ''),
+                f'本筆損益：{pnl}' if pnl != '' else '']
+    elif is_buy or is_sell:
+        head = '📥 進場訊號（模擬）'
+        dir_txt = '做多 🟢' if is_buy else '做空 🔴'
+        body = [f'策略：{strat}' if strat else '',
+                f'{dir_txt}　{symbol}' + (f' @ {price}' if price != '' else ''),
+                (f'停損 {sl}　停利 {tp}' if (sl != '' or tp != '') else ''),
+                f'口數 {qty}' if qty != '' else '']
+    else:
+        head = '🔔 策略訊號（模擬）'
+        body = [f'策略：{strat}' if strat else '', note or f'{symbol} {action}'.strip()]
+
+    msg = '\n'.join([head] + [b for b in body if b] + ['', '⚠️ 模擬通知，未實際下單'])
+    try:
+        _tv_recent.insert(0, {'t': datetime.datetime.now().strftime('%m/%d %H:%M'),
+                              'action': action, 'symbol': symbol, 'price': str(price)})
+        del _tv_recent[50:]
+    except Exception:
+        pass
+    res = _line_push(msg, 1)
+    return jsonify({'ok': True, 'parsed': {'action': action, 'symbol': symbol,
+                    'price': str(price)}, 'line': {'pushed': res.get('pushed'),
+                    'reason': res.get('reason')}, 'preview': msg})
+
+@app.route('/api/tv_log')
+def tv_log():
+    """Recent TradingView signals received (best-effort, in-memory)."""
+    return jsonify(_tv_recent)
+
 @app.route('/api/scan_and_push')
 def scan_and_push():
     """Scheduled (Vercel Cron) endpoint: push 🤖 AI/科技股精選 + 📰 新聞選股 to
