@@ -7,6 +7,6 @@
     { "src": "/(.*)", "dest": "/server.py" }
   ],
   "crons": [
-    { "path": "/api/scan_and_push", "schedule": "30 6 * * 1-5" }
+    { "path": "/api/scan_and_push", "schedule": "30 1 * * 1-5" }
   ]
 }
