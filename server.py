@@ -3259,6 +3259,161 @@ def stock_news():
     unique = _finalize_news([{**n, '_ts': _parse_pubdate(n.get('date'))} for n in unique])
     return jsonify(unique[:6])
 
+def _bt_history(code, market, rng='1y'):
+    """Daily OHLCV for backtesting, from Yahoo (one call, both suffixes)."""
+    order = ['.TWO', '.TW'] if market == 'otc' else ['.TW', '.TWO']
+    for sfx in order:
+        try:
+            url = f'https://query1.finance.yahoo.com/v8/finance/chart/{code}{sfx}?interval=1d&range={rng}'
+            d = cached_get(url, ttl=43200)
+            cr = d.get('chart', {}).get('result')
+            if not cr:
+                continue
+            ts = cr[0].get('timestamp', [])
+            q = cr[0].get('indicators', {}).get('quote', [{}])[0]
+            rows = []
+            for i in range(len(ts)):
+                c = q.get('close', [])[i] if i < len(q.get('close', [])) else None
+                if c is None:
+                    continue
+                rows.append({'c': float(c),
+                             'h': float(q.get('high', [])[i] or c),
+                             'l': float(q.get('low', [])[i] or c),
+                             'v': int(q.get('volume', [])[i] or 0)})
+            if len(rows) >= 60:
+                return rows
+        except Exception:
+            continue
+    return []
+
+def _bt_indicators(closes, highs, lows):
+    """Rolling RSI(Wilder), KD(9,3,3), MACD-hist arrays aligned to closes."""
+    n = len(closes)
+    rsi = [None] * n
+    if n > 15:
+        gains = [max(closes[i] - closes[i - 1], 0.0) for i in range(1, n)]
+        losses = [max(closes[i - 1] - closes[i], 0.0) for i in range(1, n)]
+        ag = sum(gains[:14]) / 14; al = sum(losses[:14]) / 14
+        for i in range(14, n):
+            if i > 14:
+                ag = (ag * 13 + gains[i - 1]) / 14
+                al = (al * 13 + losses[i - 1]) / 14
+            rsi[i] = 100.0 if al == 0 else 100 - 100 / (1 + ag / al)
+    k = [None] * n; d = [None] * n
+    kv = dv = 50.0
+    for i in range(n):
+        if i >= 8:
+            wh = max(highs[i - 8:i + 1]); wl = min(lows[i - 8:i + 1])
+            rsv = 50.0 if wh == wl else (closes[i] - wl) / (wh - wl) * 100
+            kv = kv * 2 / 3 + rsv / 3; dv = dv * 2 / 3 + kv / 3
+            k[i] = kv; d[i] = dv
+
+    def ema(arr, p):
+        m = 2 / (p + 1); out = [arr[0]]
+        for x in arr[1:]:
+            out.append(x * m + out[-1] * (1 - m))
+        return out
+    ef = ema(closes, 12); es = ema(closes, 26)
+    dif = [ef[i] - es[i] for i in range(n)]
+    dea = ema(dif, 9)
+    hist = [dif[i] - dea[i] for i in range(n)]
+    return rsi, k, d, hist
+
+def _backtest_signals(months=12, min_weight=6, max_hold=20):
+    """Walk historical data, fire the same bullish technical signals used live,
+    simulate entry→stop/target/time-exit, and aggregate performance. No
+    look-ahead: signals at day i use only data up to i; entry at close[i]."""
+    rng = '2y' if months > 12 else '1y'
+    pairs = [(c, 'tse') for c in POPULAR_TSE[:30]] + [(c, 'otc') for c in POPULAR_OTC[:10]]
+    from concurrent.futures import ThreadPoolExecutor
+
+    def run(pair):
+        code, market = pair
+        rows = _bt_history(code, market, rng)
+        if len(rows) < 70:
+            return []
+        rows = rows[-(months * 21 + 60):] if months * 21 + 60 < len(rows) else rows
+        closes = [r['c'] for r in rows]; highs = [r['h'] for r in rows]
+        lows = [r['l'] for r in rows]; vols = [r['v'] for r in rows]
+        rsi, k, d, hist = _bt_indicators(closes, highs, lows)
+        n = len(closes)
+        ma = lambda p, i: sum(closes[i - p + 1:i + 1]) / p if i >= p - 1 else None
+        trades = []
+        i = 30
+        while i < n - 1:
+            w = 0
+            if rsi[i] is not None and rsi[i] <= 30: w += 3
+            if k[i] is not None and d[i] is not None:
+                if k[i] < 25 and d[i] < 25: w += 3
+                if k[i - 1] is not None and k[i - 1] <= d[i - 1] and k[i] > d[i] and k[i] < 50: w += 4
+            if hist[i] is not None and hist[i - 1] is not None and hist[i - 1] < 0 and hist[i] >= 0: w += 4
+            m5, m10, m20 = ma(5, i), ma(10, i), ma(20, i)
+            if m5 and m10 and m20 and closes[i] > m5 > m10 > m20: w += 3
+            pm5, pm10 = ma(5, i - 1), ma(10, i - 1)
+            if pm5 and pm10 and m5 and m10 and pm5 <= pm10 and m5 > m10: w += 3
+            if i >= 20:
+                av20 = sum(vols[i - 19:i + 1]) / 20
+                if av20 and vols[i] > av20 * 2 and closes[i] > closes[i - 1]: w += 3
+            if w >= min_weight:
+                entry = closes[i]
+                trs = [max(highs[j] - lows[j], abs(highs[j] - closes[j - 1]), abs(lows[j] - closes[j - 1]))
+                       for j in range(max(1, i - 13), i + 1)]
+                atr = sum(trs) / len(trs) if trs else entry * 0.03
+                rl = min(lows[i - 2:i + 1])
+                stop = max(rl * 0.99, entry - 2 * atr)
+                if stop >= entry:
+                    stop = entry - 2 * atr
+                target = entry + 2 * (entry - stop)
+                outcome = None
+                for j in range(i + 1, min(i + max_hold + 1, n)):
+                    if lows[j] <= stop:
+                        outcome = (stop - entry) / entry * 100; exit_i = j; break
+                    if highs[j] >= target:
+                        outcome = (target - entry) / entry * 100; exit_i = j; break
+                if outcome is None:
+                    exit_i = min(i + max_hold, n - 1)
+                    outcome = (closes[exit_i] - entry) / entry * 100
+                trades.append({'ret': outcome, 'hold': exit_i - i, 'win': outcome > 0})
+                i = exit_i + 1  # no overlapping trades on same stock
+            else:
+                i += 1
+        return trades
+
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        all_trades = [t for lst in pool.map(run, pairs) for t in lst]
+
+    n = len(all_trades)
+    if not n:
+        return {'trades': 0, 'months': months, 'min_weight': min_weight}
+    wins = [t for t in all_trades if t['win']]
+    losses = [t for t in all_trades if not t['win']]
+    rets = [t['ret'] for t in all_trades]
+    avg = sum(rets) / n
+    aw = sum(t['ret'] for t in wins) / len(wins) if wins else 0
+    al = sum(t['ret'] for t in losses) / len(losses) if losses else 0
+    return {
+        'trades': n, 'months': months, 'min_weight': min_weight,
+        'win_rate': round(len(wins) / n * 100, 1),
+        'avg_return': round(avg, 2),
+        'avg_win': round(aw, 2), 'avg_loss': round(al, 2),
+        'expectancy': round(avg, 2),
+        'best': round(max(rets), 1), 'worst': round(min(rets), 1),
+        'avg_hold_days': round(sum(t['hold'] for t in all_trades) / n, 1),
+        'win_count': len(wins), 'loss_count': len(losses),
+    }
+
+@app.route('/api/signal_backtest')
+def signal_backtest():
+    try:
+        months = min(int(request.args.get('months', '12')), 24)
+    except ValueError:
+        months = 12
+    try:
+        mw = int(request.args.get('min_weight', '6'))
+    except ValueError:
+        mw = 6
+    return jsonify(_backtest_signals(months, mw))
+
 @app.route('/api/entry_signals')
 def entry_signals():
     return jsonify(_compute_entry_signals())

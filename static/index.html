@@ -788,6 +788,25 @@ body *{transition:background-color var(--transition-speed) ease,border-color var
     <button class="btn" onclick="querySignal()">查詢訊號</button>
   </div>
   <div id="sig-query-result"></div>
+  <div style="border-top:1px solid var(--border);margin:14px 0;padding-top:12px">
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+      <div style="font-size:14px;font-weight:700">📊 策略績效回測</div>
+      <span style="font-size:11px;color:var(--dim)">這些進場訊號過去準不準？</span>
+      <span style="flex:1"></span>
+      <select class="inp" id="bt-sig-mw" style="font-size:12px;padding:4px 8px;max-width:130px">
+        <option value="6">門檻 6（寬鬆）</option>
+        <option value="7" selected>門檻 7（標準）</option>
+        <option value="8">門檻 8（嚴格）</option>
+      </select>
+      <select class="inp" id="bt-sig-mo" style="font-size:12px;padding:4px 8px;max-width:110px">
+        <option value="6">近 6 個月</option>
+        <option value="12" selected>近 12 個月</option>
+        <option value="24">近 24 個月</option>
+      </select>
+      <button class="btn" onclick="runSignalBacktest()" style="font-size:12px">開始回測</button>
+    </div>
+    <div id="sig-bt-result"></div>
+  </div>
   <div style="border-top:1px solid var(--border);margin:16px 0;padding-top:12px">
     <div style="font-size:14px;font-weight:700;margin-bottom:4px">🔍 熱門股自動掃描</div>
     <p style="color:var(--dim);font-size:11px;margin-bottom:10px">自動掃描 RSI、KD、MACD、均線、布林帶等指標。<strong style="color:var(--red)">僅供參考，不構成投資建議。</strong></p>
@@ -2236,6 +2255,41 @@ async function loadChipAnalysis(code){
 }
 
 // ── Entry Signals (進場點位訊號) ──
+async function runSignalBacktest(){
+  const mw=$('bt-sig-mw').value, mo=$('bt-sig-mo').value;
+  const el=$('sig-bt-result');
+  el.innerHTML='<div class="loading"><span class="spin">↻</span> 回測中，模擬過去每次進場訊號的進出場…（約 10~30 秒）</div>';
+  try{
+    const r=await fetch(`/api/signal_backtest?months=${mo}&min_weight=${mw}`);
+    const d=await r.json();
+    if(!d.trades){el.innerHTML='<div style="color:var(--dim);padding:16px;text-align:center">資料不足，無法回測</div>';return}
+    const posExp=d.expectancy>=0;
+    const wc=d.win_rate>=50?'var(--red)':'var(--gold)';
+    const ec=posExp?'var(--red)':'var(--green)';
+    const cell=(label,val,color)=>`<div style="background:var(--bg);border-radius:10px;padding:12px;text-align:center"><div style="font-size:11px;color:var(--dim)">${label}</div><div style="font-size:20px;font-weight:800;${color?'color:'+color:''}">${val}</div></div>`;
+    el.innerHTML=`
+      <div style="font-size:11px;color:var(--dim);margin-bottom:8px">模擬熱門股近 ${d.months} 個月、訊號強度 ≥ ${d.min_weight}：每次出現進場訊號就買，到停損或目標價出場。</div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px">
+        ${cell('交易次數',d.trades)}
+        ${cell('勝率',d.win_rate+'%',wc)}
+        ${cell('每筆期望值',(posExp?'+':'')+d.expectancy+'%',ec)}
+        ${cell('平均賺','+'+d.avg_win+'%','var(--red)')}
+        ${cell('平均賠',d.avg_loss+'%','var(--green)')}
+        ${cell('平均持有',d.avg_hold_days+' 天')}
+      </div>
+      <div style="display:flex;gap:14px;justify-content:center;margin-top:8px;font-size:11px;color:var(--dim)">
+        <span>✅ 賺錢 ${d.win_count} 次</span><span>❌ 賠錢 ${d.loss_count} 次</span>
+        <span>最佳 +${d.best}%</span><span>最差 ${d.worst}%</span>
+      </div>
+      <div style="margin-top:10px;padding:10px;border-radius:8px;background:${posExp?'rgba(255,77,106,.08)':'rgba(0,214,143,.08)'};font-size:12px;line-height:1.6">
+        ${posExp
+          ? `📈 過去這套訊號<b>期望值為正</b>（每筆平均 ${'+'+d.expectancy}%）：勝率約 ${d.win_rate}%，但「賺的(+${d.avg_win}%)比賠的(${d.avg_loss}%)多」，靠紀律執行停損停利長期偏正。`
+          : `⚠️ 過去這套訊號<b>期望值偏弱</b>（每筆平均 ${d.expectancy}%）：建議提高訊號門檻或謹慎使用。`}
+      </div>
+      <div style="font-size:10px;color:var(--dim);margin-top:6px">※ 回測為歷史模擬、未含手續費與滑價，過去績效不代表未來，僅供參考。</div>`;
+  }catch(e){el.innerHTML='<div style="color:var(--red);padding:16px">回測失敗，請稍後再試</div>'}
+}
+
 async function querySignal(){
   const code=$('sig-inp').value.trim();
   if(!code){$('sig-inp').focus();return}
