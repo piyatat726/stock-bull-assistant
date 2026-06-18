@@ -485,6 +485,10 @@ body *{transition:background-color var(--transition-speed) ease,border-color var
 <div class="main">
 
 <div class="page active" id="page-overview">
+  <div id="va-section" style="display:none;margin-bottom:16px">
+    <div class="stitle" style="color:var(--green)">🎯 估值雷達 <span style="font-size:11px;color:var(--dim);font-weight:400">好公司跌進便宜區（低於合理價）· 進入時自動通知 · 僅供參考</span> <button class="hbtn" id="va-notify-btn" onclick="enableValueAlertPush()" style="font-size:10px;padding:3px 8px;margin-left:4px">🔔 開啟通知</button></div>
+    <div id="va-grid"></div>
+  </div>
   <div id="rec-section" style="display:none;margin-bottom:16px">
     <div class="stitle" style="color:var(--gold)">🐂 小牛推薦關注 <span style="font-size:11px;color:var(--dim);font-weight:400">基本面 + 法人動向 + 營收成長分析 · 僅供參考</span></div>
     <div class="grid g4" id="rec-grid"><div class="loading"><span class="spin">↻</span> 分析中...</div></div>
@@ -1673,6 +1677,61 @@ async function loadValuePicks(){
   }catch(e){$('value-section').style.display='none'}
 }
 
+// ── 🎯 估值雷達 (好公司跌進便宜區自動通知) ──
+function getVASeen(){try{return JSON.parse(localStorage.getItem('valueAlertSeen')||'[]')}catch(e){return[]}}
+function setVASeen(a){localStorage.setItem('valueAlertSeen',JSON.stringify(a))}
+function enableValueAlertPush(){
+  if(!('Notification' in window)){toast('此瀏覽器不支援通知','error');return}
+  Notification.requestPermission().then(p=>{
+    toast(p==='granted'?'✅ 已開啟估值雷達通知':'未開啟通知（可在瀏覽器設定開啟）', p==='granted'?'success':'info');
+    updateVANotifyBtn();
+  });
+}
+function updateVANotifyBtn(){
+  const b=$('va-notify-btn'); if(!b)return;
+  const granted=('Notification' in window)&&Notification.permission==='granted';
+  b.textContent=granted?'🔔 通知已開':'🔔 開啟通知';
+  b.style.opacity=granted?'.6':'1';
+}
+async function loadValueAlerts(){
+  try{
+    const r=await fetch('/api/value_alerts');const data=await r.json();
+    if(!data.length){$('va-section').style.display='none';setVASeen([]);return}
+    $('va-section').style.display='block';updateVANotifyBtn();
+    const wl=(typeof WL!=='undefined'?WL:[]).map(w=>w.code);
+    const held=getPStocks?getPStocks().map(s=>s.code):[];
+    $('va-grid').innerHTML='<div class="grid g4" style="display:grid;gap:10px">'+data.map(a=>{
+      const mine=wl.includes(a.code)||held.includes(a.code);
+      const metrics=[];
+      if(a.roe!=null)metrics.push(`ROE ${a.roe}%`);
+      if(a.pe!=null)metrics.push(`PE ${a.pe}`);
+      if(a.dividend_yield!=null&&a.dividend_yield>0)metrics.push(`殖利 ${a.dividend_yield}%`);
+      return`<div class="np-card" style="border-left:3px solid var(--green)">
+        <div class="np-head"><div><div class="nm">${a.name} ${mine?'<span style="font-size:9px;color:var(--gold)">★持有/關注</span>':''}</div><div class="cd">${a.code}</div></div><div class="pr ${cc(a.change_pct)||''}">${a.price}</div></div>
+        <div style="display:flex;align-items:center;gap:6px;margin:6px 0;flex-wrap:wrap">
+          <span style="font-size:12px;font-weight:800;color:var(--green)">${a.verdict_icon} ${a.verdict}</span>
+          <span style="font-size:11px;padding:2px 7px;border-radius:10px;background:rgba(16,185,129,.15);color:#10b981;font-weight:700">低估 +${a.margin_of_safety}%</span>
+        </div>
+        <div style="font-size:11px;color:var(--dim)">合理價 ${a.fair_price} · 現價 ${a.price}${metrics.length?' · '+metrics.join(' · '):''}</div>
+        ${a.pros&&a.pros.length?`<div style="font-size:10.5px;line-height:1.6;margin-top:3px">${a.pros.map(p=>'✅ '+p).join('<br>')}</div>`:''}
+      </div>`}).join('')+'</div>';
+    // ── Notify on NEW entries into the cheap zone ──
+    const codes=data.map(a=>a.code);
+    let seen=getVASeen().filter(c=>codes.includes(c)); // drop ones that left the zone (re-alertable later)
+    const fresh=data.filter(a=>!seen.includes(a.code));
+    if(fresh.length){
+      const granted=('Notification' in window)&&Notification.permission==='granted';
+      let msg;
+      if(fresh.length===1){const a=fresh[0];msg=`${a.name}(${a.code}) 跌進便宜區！現價 ${a.price}，低於合理價 ${a.fair_price}（低估 ${a.margin_of_safety}%）`;}
+      else{msg=`${fresh.length} 檔好公司進入便宜區：${fresh.slice(0,4).map(a=>a.name).join('、')}`;}
+      toast('🎯 '+msg,'info');
+      if(granted){try{new Notification('🎯 估值雷達：好公司便宜了',{body:msg,icon:'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y=".9em" font-size="90">🎯</text></svg>'});}catch(e){}}
+      seen=seen.concat(fresh.map(a=>a.code));
+    }
+    setVASeen(seen);
+  }catch(e){$('va-section').style.display='none'}
+}
+
 async function loadRecommend(){
   try{
     const r=await fetch('/api/recommend');
@@ -2551,7 +2610,7 @@ setInterval(checkPriceAlerts,15000);
 function refreshAll(){
   countdown=30;
   $('refresh-btn').classList.add('spin');
-  Promise.all([loadIndex(),loadWL(),loadMovers(),loadVolRank(),loadRecommend(),loadSellRecommend(),loadNewsPicks(),loadValuePicks(),loadGlobal(),loadDailySummary()])
+  Promise.all([loadIndex(),loadWL(),loadMovers(),loadVolRank(),loadRecommend(),loadSellRecommend(),loadNewsPicks(),loadValuePicks(),loadValueAlerts(),loadGlobal(),loadDailySummary()])
     .finally(()=>setTimeout(()=>$('refresh-btn').classList.remove('spin'),800));
 }
 

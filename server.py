@@ -1791,6 +1791,50 @@ def value_picks():
     results.sort(key=_rank, reverse=True)
     return jsonify(results[:15])
 
+@app.route('/api/value_alerts')
+def value_alerts():
+    """估值雷達: good companies (high-quality Buffett verdict) that have dropped
+    into the cheap zone — trading at least `mos`% below their reference fair
+    value. This is the trigger source for "好公司跌進便宜區" notifications."""
+    try:
+        threshold = float(request.args.get('mos', '8'))
+    except ValueError:
+        threshold = 8.0
+    fund_map = _fetch_pe_pb_yield()
+    rev_map = _fetch_revenue_growth()
+    fundamentals = _fetch_fundamentals()
+    pairs = ([(c, 'tse') for c in dict.fromkeys(POPULAR_TSE)] +
+             [(c, 'otc') for c in dict.fromkeys(POPULAR_OTC)])
+    stocks = fetch_stocks(pairs)
+    seen = set()
+    alerts = []
+    for s in stocks:
+        code = s['code']
+        if code in seen or not s.get('price'):
+            continue
+        seen.add(code)
+        f = fund_map.get(code, {})
+        b = buffett_score(fundamentals.get(code, {}), f.get('pe'), f.get('pb'),
+                          f.get('yield'), rev_map.get(code, {}).get('yoy'), s['price'])
+        if not b.get('available') or b.get('limited'):
+            continue
+        mos = b.get('margin_of_safety')
+        # Cheap zone = quality company (🎩/🟢 verdict) trading >= threshold below
+        # fair value, excluding cyclical-peak traps.
+        if (b['verdict_icon'] in ('🎩', '🟢') and mos is not None
+                and mos >= threshold and '景氣循環' not in b['verdict']):
+            alerts.append({
+                'code': code, 'name': s['name'], 'price': s['price'],
+                'change_pct': s.get('change_pct', 0), 'market': s.get('market', 'tse'),
+                'verdict': b['verdict'], 'verdict_icon': b['verdict_icon'],
+                'score': b['score'], 'roe': b['roe'], 'pe': f.get('pe'),
+                'dividend_yield': f.get('yield'),
+                'fair_price': b['fair_price'], 'margin_of_safety': mos,
+                'pros': b['pros'][:2],
+            })
+    alerts.sort(key=lambda x: x['margin_of_safety'], reverse=True)
+    return jsonify(alerts)
+
 @app.route('/api/recommend')
 def recommend():
     # 1. Fetch all fundamental data in parallel-ish (cached after first call)
