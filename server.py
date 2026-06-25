@@ -185,12 +185,39 @@ def parse_stock(item):
             change = current - yesterday
             change_pct = (change / yesterday * 100) if yesterday else 0
         else:
-            # No real trade tick yet (pre-market / post-close). Show previous
-            # close flat — never fabricate a gain/loss from the bid quote.
-            bid_str = item.get('b', '').split('_')[0]
-            current = float(bid_str) if (bid_str and bid_str != '-' and yesterday == 0) else yesterday
-            change = 0
-            change_pct = 0
+            # No last-matched-trade price (z="-"). This happens pre-market /
+            # post-close, but ALSO during intraday call-auction / disclosed-
+            # quote windows while the stock is actively trading (and even when
+            # it is locked limit-up/down). Estimate the live price from the
+            # best available quote instead of showing yesterday flat — the old
+            # code reverted to yesterday with 0% and made moving stocks (and
+            # limit-up stocks) look unchanged.
+            def _num(s):
+                try:
+                    s = str(s).split('_')[0]
+                    return float(s) if s not in ('', '-') else None
+                except (ValueError, TypeError):
+                    return None
+            bid = _num(item.get('b', ''))
+            ask = _num(item.get('a', ''))
+            o_v = _num(item.get('o', '-'))
+            hi_v = _num(item.get('h', '-'))
+            lo_v = _num(item.get('l', '-'))
+            if bid is not None and ask is not None:
+                current = (bid + ask) / 2          # quote midpoint
+            elif o_v is not None:
+                current = o_v                       # opening-auction print
+            elif hi_v is not None and lo_v is not None:
+                current = (hi_v + lo_v) / 2
+            elif bid is not None:
+                current = bid                       # locked limit-up: only a bid
+            elif ask is not None:
+                current = ask                       # locked limit-down: only an ask
+            else:
+                current = yesterday                 # truly no live data → flat
+            current = round(current, 2)
+            change = current - yesterday if yesterday else 0
+            change_pct = (change / yesterday * 100) if yesterday else 0
         if current == 0 and yesterday == 0:
             return None
         buy_prices = [float(p) for p in item.get('b', '').split('_') if p and p != '-']
@@ -215,6 +242,8 @@ def parse_stock(item):
             'open': op, 'high': hi, 'low': lo,
             'volume': item.get('v', '-'),
             'time': item.get('t', ''), 'market': item.get('ex', 'tse'),
+            'date': item.get('d', ''),          # MIS trade date YYYYMMDD (for freshness)
+            'traded': traded,                   # False = price is an estimate (z="-")
             'limit_up': item.get('u', '-'), 'limit_down': item.get('w', '-'),
             'best_bid': buy_prices[0] if buy_prices else '-',
             'best_ask': sell_prices[0] if sell_prices else '-',
@@ -258,6 +287,7 @@ def _fetch_yahoo_single(code, suffix, market):
         'open': str(round(op, 2)), 'high': str(round(hi, 2)), 'low': str(round(lo, 2)),
         'volume': str(int(vol / 1000)) if vol else '-',
         'time': '', 'market': actual_market,
+        'date': '', 'traded': True,         # Yahoo regularMarketPrice is a real last trade
         'limit_up': '-', 'limit_down': '-',
         'best_bid': '-', 'best_ask': '-',
     }
@@ -659,8 +689,8 @@ def stock_analysis():
         'pe': round(pe, 1) if pe else None,
         'pb': round(pb, 2) if pb else None,
         'dividend_yield': round(dy, 2) if dy else None,
-        'rev_yoy': round(yoy, 1) if yoy else None,
-        'rev_mom': round(mom, 1) if mom else None,
+        'rev_yoy': round(yoy, 1) if yoy is not None else None,
+        'rev_mom': round(mom, 1) if mom is not None else None,
         'institutional': {
             'foreign': inst['foreign'] // 1000 if inst else None,
             'trust': inst['trust'] // 1000 if inst else None,
@@ -1048,6 +1078,23 @@ NEGATIVE_KW = ['跌','下跌','利空','看空','砍','下修','衰退','虧損'
 def news_picks():
     return jsonify(_compute_news_picks())
 
+# Short (2-char) company names can collide with idioms in a headline
+# (隱形冠軍 → 冠軍 1806). Reject a match when EVERY occurrence sits inside a
+# known idiom context; longer names match by plain substring (rarely collide).
+_NAME_IDIOM_PREFIXES = {'冠軍': ('隱形', '世界', '銷售', '營收', '全球', '市佔', '常勝', '票房')}
+
+def _name_in_title(name, title):
+    bad = _NAME_IDIOM_PREFIXES.get(name)
+    if not bad:
+        return name in title
+    idx = title.find(name)
+    while idx != -1:
+        prefix = title[max(0, idx - 2):idx]
+        if not any(prefix.endswith(p) for p in bad):
+            return True            # a genuine (non-idiom) occurrence exists
+        idx = title.find(name, idx + 1)
+    return False                   # every occurrence was an idiom
+
 def _compute_news_picks():
     # Diverse queries surface more than just the daily mega-cap headlines
     queries = ['台股 漲停 個股', '法人 買超 個股', '營收 創新高 個股',
@@ -1065,7 +1112,7 @@ def _compute_news_picks():
             unique_news.append(n)
 
     now = datetime.datetime.now(datetime.timezone.utc)
-    RECENT_HOURS = 96  # only news within last 4 days counts (drops weeks-old stale picks)
+    RECENT_HOURS = 36  # only the LATEST news counts (today + yesterday) — user wants 最新
 
     picks = {}
     for n in unique_news:
@@ -1081,13 +1128,22 @@ def _compute_news_picks():
         age_h = (now - ts).total_seconds() / 3600
         if age_h > RECENT_HOURS:
             continue
+        # Skip multi-stock roundup / aggregator headlines — they name many
+        # tickers and would spawn a (low-conviction) pick for each.
+        if any(kw in title for kw in ('1次看', '一次看', '10大', '十大', '買超榜',
+                                      '賣超榜', '排行榜', '懶人包', '總整理', '爆料同學會')):
+            continue
         # Find all company names in the title (skip 1-char names — too noisy)
         matched = [(name, code) for name, code in NAME_TO_CODE.items()
-                   if len(name) >= 2 and name in title]
+                   if len(name) >= 2 and _name_in_title(name, title)]
         # Drop names that are substrings of a longer matched name
         # (e.g. "聯發" when "聯發科" also matched → keep only 聯發科)
         matched = [(nm, cd) for nm, cd in matched
                    if not any(nm != other and nm in other for other, _ in matched)]
+        # A focused signal mentions 1-3 stocks; 4+ tickers in one title is a
+        # roundup list, not a conviction pick → skip the whole headline.
+        if len(matched) > 3:
+            continue
         for name, code in matched:
             if code not in picks:
                 picks[code] = {'code': code, 'name': name, 'news': [],
@@ -1105,7 +1161,8 @@ def _compute_news_picks():
         return []
 
     codes = list(picks.keys())
-    otc_codes = set(POPULAR_OTC)
+    otc_codes = set(POPULAR_OTC) | {c for c, m in TECH_AI if m == 'otc'} \
+        | {'6426', '3529', '6180', '8044', '4763', '6770', '5289'}
     pairs = [(c, 'otc' if c in otc_codes else 'tse') for c in codes]
     stocks = fetch_stocks(pairs)
     smap = {s['code']: s for s in stocks}
@@ -1122,7 +1179,11 @@ def _compute_news_picks():
         fresh_h = pk['fresh_h']
         # Blended score: positive-keyword strength + mention count + today's
         # momentum, minus a freshness penalty (older news ranks lower)
-        hot = pk['kw'] * 2 + pk['mentions'] * 1.5 + chg * 0.6 - (fresh_h / 24)
+        hot = pk['kw'] * 2 + pk['mentions'] * 1.5 + chg * 0.6 - (fresh_h / 12)  # stronger freshness weight
+        # Drop non-positive picks — these are stale / idiom-collision noise
+        # (e.g. a 2-char name that only appeared inside an idiom).
+        if hot <= 0:
+            continue
         results.append({
             'code': code, 'name': pk['name'],
             'price': s.get('price', 0),
@@ -1167,15 +1228,17 @@ def news():
 def _fetch_pe_pb_yield():
     """Fetch PE ratio, PB ratio, dividend yield for all TSE + OTC stocks"""
     result = {}
-    # TSE stocks
+    # TSE stocks. IMPORTANT: the BWIBBU_ALL endpoint WITHOUT a date param returns
+    # a frozen 2017-12-18 snapshot (stale by years!). Use BWIBBU_d, which returns
+    # the latest trading day. Columns: [code, name, close, 殖利率%, 股利年度, 本益比(PE), 股價淨值比(PB), 財報年季].
     try:
-        data = cached_get('https://www.twse.com.tw/rwd/zh/afterTrading/BWIBBU_ALL?response=json', ttl=3600)
+        data = cached_get('https://www.twse.com.tw/exchangeReport/BWIBBU_d?response=json&selectType=ALL', ttl=3600)
         for row in data.get('data', []):
             try:
                 code = row[0].strip()
-                pe = float(row[2]) if row[2] and row[2] != '-' else None
+                pe = float(row[5]) if row[5] and row[5] != '-' else None
                 dy = float(row[3]) if row[3] and row[3] != '-' else None
-                pb = float(row[4]) if row[4] and row[4] != '-' else None
+                pb = float(row[6]) if row[6] and row[6] != '-' else None
                 result[code] = {'pe': pe, 'yield': dy, 'pb': pb}
             except (ValueError, IndexError):
                 continue
@@ -1354,24 +1417,35 @@ def _fetch_fundamentals():
             except Exception:
                 continue
 
-    # ROE = annualized net income / equity (cumulative YTD → ×4/quarter).
-    # Fallback: annualized EPS / book value per share (per-share consistent —
-    # works for financial holdings where the total-net-income field is blank).
+    # ROE: prefer a REAL trailing-12m ROE from the exchange's published trailing
+    # PE and PB — ROE_TTM = (price/PE) / (price/PB) = PB/PE. PE is based on the
+    # last-four-quarter EPS and PB on current book value, so PB÷PE is the true
+    # TTM return on equity (per-share consistent). This avoids the old
+    # ×4-single-quarter over-statement that made cyclical/seasonal names look
+    # like 100%+ and got clamped to an identical fake 60. Fall back to the
+    # annualized-interim estimate (flagged roe_est) only when PE/PB are missing
+    # (e.g. loss-makers with no PE, or names not in BWIBBU).
+    pe_pb = _fetch_pe_pb_yield()
     for code, d in result.items():
         ni, eq, q = d.get('net_income'), d.get('equity'), d.get('quarter')
         factor = 4 / q if q else 4
         eps_ann = round(d['eps'] * factor, 2) if d.get('eps') is not None else None
         d['eps_annual'] = eps_ann
-        roe = None
-        if ni is not None and eq and eq > 0:
-            roe = round(ni / eq * 100 * factor, 1)
-        elif eps_ann is not None and d.get('book_value') and d['book_value'] > 0:
-            roe = round(eps_ann / d['book_value'] * 100, 1)
-        # Annualizing a single strong quarter (×4) can over-state ROE; cap the
-        # display at a high-but-believable ceiling to avoid artifacts like 104%.
-        if roe is not None and roe > 60:
-            roe = 60.0
+        roe, roe_est = None, False
+        pp = pe_pb.get(code) or {}
+        pe, pb = pp.get('pe'), pp.get('pb')
+        if pe and pe > 0 and pb and pb > 0:
+            roe = round(pb / pe * 100, 1)          # real TTM ROE (PB ÷ PE)
+        else:
+            roe_est = bool(q and q < 4)            # annualized interim → estimate
+            if ni is not None and eq and eq > 0:
+                roe = round(ni / eq * 100 * factor, 1)
+            elif eps_ann is not None and d.get('book_value') and d['book_value'] > 0:
+                roe = round(eps_ann / d['book_value'] * 100, 1)
+        if roe is not None and roe > 200:           # tiny-base / parse-artifact guard
+            roe = None
         d['roe'] = roe
+        d['roe_est'] = roe_est
     return result
 
 def _fair_price(pe, price, roe, rev_yoy, debt, is_fin):
@@ -1384,7 +1458,7 @@ def _fair_price(pe, price, roe, rev_yoy, debt, is_fin):
     if roe is not None:
         fair_pe += min(max((roe - 10) * 0.4, -5), 7)
     # Growth premium only when quality (ROE) supports it — avoids cyclical trap
-    if rev_yoy is not None and (roe is None or roe >= 10):
+    if not is_fin and rev_yoy is not None and (roe is None or roe >= 10):
         fair_pe += min(max(rev_yoy * 0.10, -3), 4)
     if debt is not None and debt > 70:
         fair_pe -= 2
@@ -1404,6 +1478,7 @@ def buffett_score(fund, pe, pb, dy, rev_yoy, price):
     plain-language verdict + reasons, and a reference fair price."""
     fund = fund or {}
     roe = fund.get('roe')
+    roe_sfx = '（年化估）' if fund.get('roe_est') else ''  # interim quarter ×4 → estimate
     nm = fund.get('net_margin')
     gm = fund.get('gross_margin')
     debt = fund.get('debt_ratio')
@@ -1456,9 +1531,9 @@ def buffett_score(fund, pe, pb, dy, rev_yoy, price):
         # ── Financial scorecard: ROE(35) + Value(40) + Dividend(25) ──
         q = 0
         if roe is not None:
-            if roe >= 15: q += 35; pros.append(f'ROE 高達 {roe:.0f}%，金融股中的績優生')
-            elif roe >= 12: q += 28; pros.append(f'ROE {roe:.0f}%，獲利能力佳')
-            elif roe >= 10: q += 22; pros.append(f'ROE {roe:.0f}%，穩健')
+            if roe >= 15: q += 35; pros.append(f'ROE 高達 {roe:.0f}%{roe_sfx}，金融股中的績優生')
+            elif roe >= 12: q += 28; pros.append(f'ROE {roe:.0f}%{roe_sfx}，獲利能力佳')
+            elif roe >= 10: q += 22; pros.append(f'ROE {roe:.0f}%{roe_sfx}，穩健')
             elif roe >= 8: q += 15
             elif roe >= 5: q += 8
             elif roe >= 0: q += 3
@@ -1513,9 +1588,9 @@ def buffett_score(fund, pe, pb, dy, rev_yoy, price):
         # ── General-industry scorecard: Quality(35)+Health(20)+Value(25)+Growth(10)+Dividend(10) ──
         q = 0
         if roe is not None:
-            if roe >= 20: q += 15; pros.append(f'股東報酬率(ROE)高達 {roe:.0f}%，賺錢效率一流')
-            elif roe >= 15: q += 12; pros.append(f'ROE {roe:.0f}%，獲利能力優秀')
-            elif roe >= 10: q += 8; pros.append(f'ROE {roe:.0f}%，獲利能力穩健')
+            if roe >= 20: q += 15; pros.append(f'股東報酬率(ROE)高達 {roe:.0f}%{roe_sfx}，賺錢效率一流')
+            elif roe >= 15: q += 12; pros.append(f'ROE {roe:.0f}%{roe_sfx}，獲利能力優秀')
+            elif roe >= 10: q += 8; pros.append(f'ROE {roe:.0f}%{roe_sfx}，獲利能力穩健')
             elif roe >= 5: q += 4
             elif roe >= 0: q += 1
             else: cons.append(f'ROE 為負 ({roe:.0f}%)，股東的錢沒在賺錢')
@@ -1614,13 +1689,14 @@ def buffett_score(fund, pe, pb, dy, rev_yoy, price):
         'verdict': verdict, 'verdict_icon': vicon, 'verdict_desc': vdesc,
         'pros': pros[:5], 'cons': cons[:4],
         'fair_price': fair_price, 'margin_of_safety': margin_of_safety,
-        'roe': roe, 'net_margin': nm, 'gross_margin': gm, 'debt_ratio': debt,
+        'roe': roe, 'roe_est': fund.get('roe_est'),
+        'net_margin': nm, 'gross_margin': gm, 'debt_ratio': debt,
         'eps': fund.get('eps'), 'eps_annual': fund.get('eps_annual'),
         'book_value': fund.get('book_value'), 'period': fund.get('period'),
         'is_financial': is_fin,
     }
 
-def _dividend_quality(code, market, price=None, eps_annual=None):
+def _dividend_quality(code, market, price=None, eps_annual=None, exch_yield=None):
     """Dividend track record (存股 / income view) from Yahoo dividend history:
     consecutive payout years, trailing-12m dividend, payout ratio, trend, and
     an income-investing score + verdict. Returns None if no dividend record."""
@@ -1675,7 +1751,11 @@ def _dividend_quality(code, market, price=None, eps_annual=None):
             trend = 'shrinking'
     ttm = round(ttm, 2)
     payout = round(ttm / eps_annual * 100, 1) if (eps_annual and eps_annual > 0) else None
-    yld = round(ttm / price * 100, 2) if price else None
+    ttm_yld = round(ttm / price * 100, 2) if price else None
+    # Prefer the exchange-published yield (authoritative; matches the Buffett
+    # block & top-level dividend_yield) so one stock never shows two different
+    # 殖利率. Fall back to the TTM-derived value only when the exchange omits it.
+    yld = exch_yield if exch_yield is not None else ttm_yld
 
     score = 0
     if consec >= 10: score += 40
@@ -1697,7 +1777,10 @@ def _dividend_quality(code, market, price=None, eps_annual=None):
     elif trend == 'shrinking': score -= 5
     score = max(0, min(score, 100))
 
-    unsustainable = (payout is not None and payout > 110)
+    # payout denominator (eps_annual) is annualized from an interim quarter (an
+    # estimate), so widen the 'unsustainable' gate to avoid false alarms from
+    # extrapolation noise; a real >125% payout is still flagged.
+    unsustainable = (payout is not None and payout > 125)
     extreme_yield = (yld is not None and yld > 10)
     if unsustainable or (extreme_yield and (payout is None or payout > 90)):
         verdict, vicon = '高息但恐難持續', '⚠️'
@@ -1706,12 +1789,17 @@ def _dividend_quality(code, market, price=None, eps_annual=None):
     elif consec >= 8 and (yld or 0) >= 3 and (payout is None or payout <= 85) and trend != 'shrinking':
         verdict, vicon = '優質存股', '🏆'
         vdesc = f'連續配息 {consec} 年、殖利率佳且配息可持續，存股首選'
-    elif consec >= 5 and (yld or 0) >= 2.5:
+    elif consec >= 5 and (yld or 0) >= 2.5 and trend != 'shrinking':
         verdict, vicon = '穩定存股', '💰'
         vdesc = f'連續配息 {consec} 年，配息穩定，適合長期持有領息'
-    elif consec >= 3:
+    elif consec >= 3 and trend != 'shrinking':
         verdict, vicon = '配息穩定', '📅'
         vdesc = f'連續配息 {consec} 年，配息紀錄尚可'
+    elif consec >= 3 and trend == 'shrinking':
+        # Long record but cutting payouts — say so truthfully instead of falling
+        # through to "配息紀錄偏短" (which wrongly calls a 10-yr payer 'short').
+        verdict, vicon = '配息穩定但縮水', '📉'
+        vdesc = f'連續配息 {consec} 年，但近年股利縮水，存股前留意獲利能否回穩'
     elif consec >= 1:
         verdict, vicon = '配息紀錄偏短', '🟡'
         vdesc = '配息年數不長，存股前建議觀察持續性'
@@ -1766,6 +1854,48 @@ def _fetch_institutional():
                 except (ValueError, IndexError):
                     continue
             break
+
+    # T86 is TSE-only; merge the TPEX three-major-investors daily feed so 上櫃
+    # (OTC) stocks (e.g. 群聯 8299, 信驊 5274, 世界先進 5347) aren't shown with
+    # 法人 = 0. Values are in shares (same as T86), so the consumers' //1000 →
+    # 張 conversion works unchanged. Only add codes not already present.
+    try:
+        tpex = cached_get('https://www.tpex.org.tw/openapi/v1/tpex_3insti_daily_trading', ttl=1800)
+        if isinstance(tpex, list) and tpex:
+            keys = list(tpex[0].keys())
+
+            def _find(*subs):
+                for k in keys:
+                    kl = k.lower().replace(' ', '')
+                    if all(s in kl for s in subs):
+                        return k
+                return None
+
+            k_code = _find('securitiescompanycode') or _find('securitiescode') or _find('code')
+            k_name = _find('companyname') or _find('name')
+            k_total = _find('total', 'difference')
+            k_foreign = _find('foreign', 'difference')
+            k_trust = _find('trust', 'difference')
+
+            def _i(v):
+                try:
+                    return int(str(v or '0').replace(',', '').strip() or 0)
+                except (ValueError, TypeError):
+                    return 0
+
+            if k_code and k_total:
+                for row in tpex:
+                    code = str(row.get(k_code, '')).strip()
+                    if not code or code in inst_map:
+                        continue
+                    inst_map[code] = {
+                        'name': str(row.get(k_name, '')).strip() if k_name else '',
+                        'foreign': _i(row.get(k_foreign)) if k_foreign else 0,
+                        'trust': _i(row.get(k_trust)) if k_trust else 0,
+                        'total': _i(row.get(k_total)),
+                    }
+    except Exception:
+        pass
     return inst_map
 
 def _compute_tech_picks():
@@ -1809,7 +1939,7 @@ def _compute_tech_picks():
             elif yoy < 0:
                 score -= 1
         if roe is not None and roe >= 20:
-            score += 1.5; reasons.append(f'ROE {roe:.0f}%')
+            score += 1.5; reasons.append(f'ROE {roe:.0f}%' + ('(年化)' if f.get('roe_est') else ''))
         elif roe is not None and roe >= 12:
             score += 1
         if gm is not None and gm >= 40 and len(reasons) < 3:
@@ -1944,6 +2074,31 @@ def _line_push(msg, count):
     except Exception as e:
         return {'pushed': False, 'error': str(e), 'count': count}
 
+def _pnl_record(items):
+    """Best-effort: POST strong entry signals to the Val.town paper-trade
+    ledger (累計戰績) as new open positions. No-op if PNL_VAL_URL is unset.
+    The ledger auto-closes them on stop/target/time and tracks the record."""
+    url = os.environ.get('PNL_VAL_URL', '')
+    if not url or not items:
+        return {'recorded': 0}
+    secret = os.environ.get('PNL_SECRET', '')
+    endpoint = url.rstrip('/') + '/api/record'
+    n = 0
+    for s in items:
+        try:
+            tags = '、'.join(sig.get('type', '') for sig in s.get('signals', [])[:2])
+            payload = {'secret': secret, 'action': 'entry',
+                       'code': s.get('code'), 'name': s.get('name'),
+                       'market': s.get('market', 'tse'), 'entry': s.get('entry'),
+                       'stop': s.get('stop_loss'), 'target': s.get('target'),
+                       'strategy': tags, 'source': 'signal'}
+            r = requests.post(endpoint, json=payload, timeout=5)
+            if r.status_code == 200 and (r.json() or {}).get('ok'):
+                n += 1
+        except Exception:
+            pass
+    return {'recorded': n}
+
 # Best-effort recent TradingView signals (in-memory; resets on cold start)
 _tv_recent = []
 
@@ -2025,6 +2180,151 @@ def tv_log():
     """Recent TradingView signals received (best-effort, in-memory)."""
     return jsonify(_tv_recent)
 
+@app.route('/api/pnl_stats')
+def pnl_stats():
+    """Proxy the Val.town paper-trade ledger (累計戰績) for the 訊號 page.
+    Returns {enabled, dashboard_url, stats}. Cached 2 min."""
+    url = os.environ.get('PNL_VAL_URL', '')
+    if not url:
+        return jsonify({'enabled': False})
+    data = cached_get(url.rstrip('/') + '/api/stats', ttl=120, timeout=10)
+    return jsonify({'enabled': True, 'dashboard_url': url, 'stats': data or {}})
+
+def _fetch_us_quote(ticker):
+    """Live quote for a US ticker via Yahoo (price + today's change %)."""
+    try:
+        d = cached_get(f'https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=1d', ttl=120, timeout=8)
+        meta = ((d.get('chart', {}) or {}).get('result') or [{}])[0].get('meta', {}) or {}
+        price = meta.get('regularMarketPrice')
+        prev = meta.get('chartPreviousClose') or meta.get('previousClose')
+        if price and prev:
+            return {'price': round(float(price), 2), 'change_pct': round((price - prev) / prev * 100, 2)}
+    except Exception:
+        pass
+    return None
+
+def _enrich_gooaye(data):
+    """Attach live quotes (台股 via app feed, 美股 via Yahoo) to every ticker the
+    股癌 page lists, plus the subset that ALSO has a current app entry signal —
+    turning the static list into a live, data-backed cross-reference."""
+    import re
+    from concurrent.futures import ThreadPoolExecutor
+    tw_codes, us_tickers = [], []
+    for g in (data.get('groups') or []):
+        for s in (g.get('tw') or []):
+            m = re.search(r'(\d{4,6})', str(s))
+            if m:
+                tw_codes.append(m.group(1))
+        for s in (g.get('us') or []):
+            toks = re.findall(r'[A-Za-z]{2,6}', str(s))
+            if toks:
+                us_tickers.append(toks[-1].upper())
+    tw_codes = list(dict.fromkeys(tw_codes))
+    us_tickers = list(dict.fromkeys(us_tickers))
+    live = {}
+    if tw_codes:
+        otc = set(POPULAR_OTC) | {c for c, m in TECH_AI if m == 'otc'}
+        pairs = [(c, 'otc' if c in otc else 'tse') for c in tw_codes]
+        mkt = dict(pairs)
+        for s in fetch_stocks(pairs):
+            if s and s.get('code') and s.get('price'):
+                live[s['code']] = {'price': s['price'], 'change_pct': s.get('change_pct', 0)}
+        # Retry the OPPOSITE market for any code we couldn't price (OTC stocks
+        # not in our lists get guessed as 上市 and miss) so every pick gets a quote.
+        missing = [(c, 'tse' if mkt.get(c) == 'otc' else 'otc') for c in tw_codes if c not in live]
+        if missing:
+            for s in fetch_stocks(missing):
+                if s and s.get('code') and s.get('price'):
+                    live[s['code']] = {'price': s['price'], 'change_pct': s.get('change_pct', 0)}
+    if us_tickers:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for t, q in zip(us_tickers, pool.map(_fetch_us_quote, us_tickers)):
+                if q:
+                    live[t] = q
+    try:
+        sig = {s['code'] for s in _compute_entry_signals() if s.get('total_weight', 0) >= 6}
+    except Exception:
+        sig = set()
+    data['live'] = live
+    data['signals'] = [c for c in tw_codes if c in sig]
+    return data
+
+_gooaye_cache = {'t': 0, 'data': None}
+
+@app.route('/api/gooaye')
+def gooaye():
+    """Proxy the 股癌 Podcast 重點 page (curated on Val.town), enriched with live
+    台股/美股 quotes + which picks currently flash an app technical signal."""
+    if _gooaye_cache['data'] is not None and time.time() - _gooaye_cache['t'] < 90:
+        return jsonify(_gooaye_cache['data'])
+    url = os.environ.get('PNL_VAL_URL', '')
+    if not url:
+        return jsonify({'groups': []})
+    data = cached_get(url.rstrip('/') + '/api/gooaye', ttl=120, timeout=10) or {'groups': []}
+    try:
+        data = _enrich_gooaye(dict(data))
+    except Exception:
+        pass
+    _gooaye_cache['t'] = time.time()
+    _gooaye_cache['data'] = data
+    return jsonify(data)
+
+@app.route('/api/line_status')
+def line_status():
+    """Diagnostic: is the LINE token valid, and is the free-tier monthly message
+    quota exhausted? (A used-up free quota makes broadcast return HTTP 200 but
+    silently NOT deliver.) Returns non-sensitive quota/usage + bot name."""
+    token = os.environ.get('LINE_CHANNEL_TOKEN', '')
+    if not token:
+        return jsonify({'ok': False, 'reason': 'LINE_CHANNEL_TOKEN not set'})
+    h = {'Authorization': f'Bearer {token}'}
+    out = {'ok': True, 'has_line_to': bool(os.environ.get('LINE_TO'))}
+    for key, ep in [('bot', 'https://api.line.me/v2/bot/info'),
+                    ('quota', 'https://api.line.me/v2/bot/message/quota'),
+                    ('consumption', 'https://api.line.me/v2/bot/message/quota/consumption')]:
+        try:
+            r = requests.get(ep, headers=h, timeout=8)
+            if r.status_code == 200:
+                j = r.json()
+                out[key] = {'displayName': j.get('displayName'), 'basicId': j.get('basicId')} if key == 'bot' else j
+            else:
+                out[key] = {'http': r.status_code, 'resp': r.text[:160]}
+        except Exception as e:
+            out[key] = {'error': str(e)}
+    # Friendly verdict
+    q = out.get('quota') or {}
+    c = out.get('consumption') or {}
+    if isinstance(q, dict) and q.get('type') == 'limited' and isinstance(c, dict) and isinstance(c.get('totalUsage'), int):
+        remain = q.get('value', 0) - c['totalUsage']
+        out['free_quota_remaining'] = remain
+        out['quota_exhausted'] = remain <= 0
+    return jsonify(out)
+
+@app.route('/api/line_webhook', methods=['POST', 'GET'])
+def line_webhook():
+    """LINE Messaging API webhook. Captures the sender's userId (one-time, so we
+    can switch from broadcast to instant direct push) and saves it to the
+    Val.town store, where it can be read and promoted to the LINE_TO env var."""
+    if request.method == 'GET':
+        return jsonify({'ok': True, 'msg': 'LINE webhook ready'})
+    payload = request.get_json(force=True, silent=True) or {}
+    uid = ''
+    for ev in payload.get('events', []):
+        src = ev.get('source', {}) or {}
+        if src.get('userId'):
+            uid = src['userId']
+            break
+    if uid:
+        val_url = os.environ.get('PNL_VAL_URL', '')
+        if val_url:
+            try:
+                requests.post(val_url.rstrip('/') + '/api/save-uid',
+                              json={'secret': os.environ.get('PNL_SECRET', ''), 'uid': uid},
+                              timeout=6)
+            except Exception:
+                pass
+    return jsonify({'ok': True, 'captured': bool(uid)})
+
 @app.route('/api/scan_and_push')
 def scan_and_push():
     """Scheduled (Vercel Cron) endpoint: push 🤖 AI/科技股精選 + 📰 新聞選股 to
@@ -2055,38 +2355,418 @@ def scan_and_push():
         lines += ['', '※ 僅供參考，不構成投資建議']
         return jsonify(_line_push('\n'.join(lines), len(alerts)))
 
-    # Default: 技術面進場訊號 + AI/科技股精選 + 新聞選股
-    sigs = _compute_entry_signals()
-    tech = _compute_tech_picks()
+    # Default: ⭐ 今日綜合推薦 (fused signals — the smartest, actionable list) + 📰 最新新聞
+    buys = _compute_top_buys()[:5]
     news = _compute_news_picks()
-    sig_strong = [s for s in sigs if s.get('total_weight', 0) >= 8][:5]
-    tech_strong = [t for t in tech if t['score'] >= 2][:5] or tech[:4]
+    sig_strong = [s for s in _compute_entry_signals()
+                  if s.get('total_weight', 0) >= 8][:5]   # for the 累計戰績 ledger
     sections = []
-    if sig_strong:
-        block = ['📊 技術面進場訊號']
-        for s in sig_strong:
-            tags = '、'.join(sig['type'] for sig in s.get('signals', [])[:2])
-            block.append(f"・{s['name']}({s['code']})　{s['change_pct']:+.1f}%"
-                         f"\n　進場 {s['entry']}｜停損 {s['stop_loss']}｜目標 {s['target']}"
-                         + (f"\n　{tags}" if tags else ''))
-        sections.append('\n'.join(block))
-    if tech_strong:
-        block = ['🤖 AI/科技股精選']
-        for t in tech_strong:
-            tag = '｜'.join(t['reasons'][:2]) if t.get('reasons') else ''
-            block.append(f"・{t['name']}({t['code']})　{t['change_pct']:+.1f}%" + (f"\n　{tag}" if tag else ''))
+    if buys:
+        block = ['⭐ 今日綜合推薦（多訊號命中＝越強）']
+        for b in buys:
+            srcs = '＋'.join(b.get('sources', []))
+            line = (f"・{b['name']}({b['code']})　{b.get('change_pct', 0):+.1f}%"
+                    + (f"　[{srcs}]" if srcs else ''))
+            if b.get('entry'):
+                line += f"\n　進場 {b['entry']}｜停損 {b['stop_loss']}｜目標 {b['target']}"
+            block.append(line)
         sections.append('\n'.join(block))
     if news:
-        block = ['📰 新聞熱門選股']
-        for n in news[:5]:
+        block = ['📰 新聞熱門（最新）']
+        for n in news[:4]:
             block.append(f"・{n['name']}({n['code']})　{n['change_pct']:+.1f}%　新聞提及 {n['score']} 次")
         sections.append('\n'.join(block))
 
     if not sections:
         return jsonify({'pushed': False, 'reason': 'no picks today', 'count': 0})
 
-    msg = f'📈 台股盤後精選（{today}）\n\n' + '\n\n'.join(sections) + '\n\n※ 僅供參考，不構成投資建議'
-    return jsonify(_line_push(msg, len(sig_strong) + len(tech_strong) + len(news[:5])))
+    tw_hour = (datetime.datetime.utcnow().hour + 8) % 24
+    head = '台股開盤精選' if tw_hour < 12 else '台股盤後精選'
+    msg = f'📈 {head}（{today}）\n\n' + '\n\n'.join(sections) + '\n\n※ 僅供參考，不構成投資建議'
+    res = _line_push(msg, len(buys) + len(news[:4]))
+    # Record technical entries to the 累計戰績 ledger AFTER the push, so the
+    # bookkeeping can never delay or block the user-critical LINE message.
+    if sig_strong:
+        _pnl_record(sig_strong)
+    return jsonify(res)
+
+def _compute_top_buys():
+    """今日綜合推薦：fuse the FRESHEST signals — 技術進場訊號 + 利多新聞 + 科技動能
+    + 估值便宜 — and rank stocks confirmed by several at once. Each pick carries
+    combined reasons + entry/stop/target (when a technical signal exists)."""
+    cand = {}
+
+    def _c(code, name, price, change):
+        c = cand.get(code)
+        if not c:
+            c = cand[code] = {'code': code, 'name': name or code, 'price': price,
+                              'change_pct': change, 'score': 0.0, 'sources': [], 'reasons': []}
+        if (not c.get('price')) and price:
+            c['price'] = price
+            c['change_pct'] = change
+        return c
+
+    try:  # 1) 技術進場訊號 (actionable — entry/stop/target)
+        for s in _compute_entry_signals():
+            if s.get('total_weight', 0) < 5:
+                continue
+            c = _c(s['code'], s.get('name'), s.get('price'), s.get('change_pct', 0))
+            c['score'] += min(s['total_weight'], 12)
+            if '技術進場' not in c['sources']:
+                c['sources'].append('技術進場')
+            tags = '、'.join(sig.get('type', '') for sig in s.get('signals', [])[:2])
+            if tags:
+                c['reasons'].append('技術：' + tags)
+            for k in ('entry', 'stop_loss', 'target', 'risk_reward'):
+                c[k] = s.get(k)
+    except Exception:
+        pass
+
+    try:  # 2) 利多新聞 (fresh, positive — RECENT_HOURS tightened to 36h)
+        for n in _compute_news_picks()[:12]:
+            c = _c(n['code'], n.get('name'), n.get('price'), n.get('change_pct', 0))
+            c['score'] += min(n.get('hot', 0), 8)
+            if '利多新聞' not in c['sources']:
+                c['sources'].append('利多新聞')
+            c['reasons'].append(f"利多新聞 {n.get('score', 1)} 則")
+    except Exception:
+        pass
+
+    try:  # 3) 科技動能 (法人/營收/ROE)
+        for t in _compute_tech_picks():
+            if t.get('score', 0) < 2:
+                continue
+            c = _c(t['code'], t.get('name'), t.get('price'), t.get('change_pct', 0))
+            c['score'] += min(t['score'], 7)
+            if '科技動能' not in c['sources']:
+                c['sources'].append('科技動能')
+            r = '｜'.join(t.get('reasons', [])[:2])
+            if r:
+                c['reasons'].append(r)
+    except Exception:
+        pass
+
+    try:  # 4) 估值便宜的好公司
+        for a in _scan_value_alerts(8.0):
+            c = _c(a['code'], a.get('name'), a.get('price'), a.get('change_pct', 0))
+            c['score'] += 6
+            if '估值便宜' not in c['sources']:
+                c['sources'].append('估值便宜')
+            c['reasons'].append(f"估值低估 {a.get('margin_of_safety')}%")
+    except Exception:
+        pass
+
+    out = []
+    for c in cand.values():
+        if not c.get('price'):
+            continue
+        c['n_sources'] = len(c['sources'])
+        c['score'] = round(c['score'] + (c['n_sources'] - 1) * 4, 1)   # multi-signal bonus
+        out.append(c)
+    out.sort(key=lambda x: x['score'], reverse=True)
+    return out[:15]
+
+_topbuys_cache = {'t': 0, 'data': None}
+
+@app.route('/api/top_buys')
+def top_buys():
+    """今日綜合推薦：從最新資料(技術/新聞/動能/估值)綜合篩出可關注的買進候選。"""
+    if _topbuys_cache['data'] is not None and time.time() - _topbuys_cache['t'] < 120:
+        return jsonify(_topbuys_cache['data'])
+    data = _compute_top_buys()
+    _topbuys_cache['t'] = time.time()
+    _topbuys_cache['data'] = data
+    return jsonify(data)
+
+def _ai_complete(prompt, system='你是專業、客觀、謹慎的台股分析助理。'):
+    """Call an LLM — Claude (ANTHROPIC_API_KEY) preferred, else ChatGPT
+    (OPENAI_API_KEY). Model overridable via AI_MODEL. Returns text or None."""
+    ak = os.environ.get('ANTHROPIC_API_KEY', '')
+    ok = os.environ.get('OPENAI_API_KEY', '')
+    try:
+        if ak:
+            model = os.environ.get('AI_MODEL', 'claude-sonnet-4-6')
+            r = requests.post('https://api.anthropic.com/v1/messages',
+                headers={'x-api-key': ak, 'anthropic-version': '2023-06-01', 'content-type': 'application/json'},
+                json={'model': model, 'max_tokens': 800, 'system': system,
+                      'messages': [{'role': 'user', 'content': prompt}]}, timeout=45)
+            if r.status_code == 200:
+                return r.json()['content'][0]['text']
+            return f'(Claude API 錯誤 {r.status_code}：{r.text[:140]})'
+        if ok:
+            model = os.environ.get('AI_MODEL', 'gpt-4o-mini')
+            r = requests.post('https://api.openai.com/v1/chat/completions',
+                headers={'Authorization': f'Bearer {ok}', 'content-type': 'application/json'},
+                json={'model': model, 'max_tokens': 800,
+                      'messages': [{'role': 'system', 'content': system}, {'role': 'user', 'content': prompt}]},
+                timeout=45)
+            if r.status_code == 200:
+                return r.json()['choices'][0]['message']['content']
+            return f'(OpenAI API 錯誤 {r.status_code}：{r.text[:140]})'
+    except Exception as e:
+        return f'(AI 連線失敗：{str(e)[:140]})'
+    return None
+
+@app.route('/api/ai_analysis', methods=['POST'])
+def ai_analysis():
+    """AI 個股體檢：用 app 已算好的數據 + 最新新聞，請 LLM 給白話、客觀、含風險的觀點。"""
+    if not (os.environ.get('ANTHROPIC_API_KEY') or os.environ.get('OPENAI_API_KEY')):
+        return jsonify({'ok': False, 'need_key': True,
+                        'msg': '尚未設定 AI 金鑰。請到 Vercel 設 ANTHROPIC_API_KEY（用 Claude）或 OPENAI_API_KEY（用 ChatGPT）。'})
+    body = request.get_json(force=True, silent=True) or {}
+    code = str(body.get('code', '')).strip()
+    name = str(body.get('name', code)).strip()
+    summary = str(body.get('summary', '')).strip()
+    heads = []
+    try:
+        for n in fetch_google_news(name, limit=6)[:5]:
+            heads.append('・' + n['title'])
+    except Exception:
+        pass
+    news_txt = '\n'.join(heads) if heads else '（無近期新聞）'
+    prompt = (f'請分析台股「{name}（{code}）」現在的狀況，繁體中文、條列、白話、精簡。\n\n'
+              f'【目前數據】\n{summary or "（無提供）"}\n\n'
+              f'【最新新聞標題】\n{news_txt}\n\n'
+              '請依序給：\n1) 一句話總結現在狀況\n2) 利多 1-2 點、利空 1-2 點\n'
+              '3) 技術面與估值面的客觀觀察\n4) 若要進場，該注意的風險與停損紀律\n\n'
+              '務必客觀中立，結尾標明「以上為資料整理，不構成投資建議」，不要保證漲跌。')
+    text = _ai_complete(prompt)
+    if not text:
+        return jsonify({'ok': False, 'msg': 'AI 無回應'})
+    return jsonify({'ok': True, 'analysis': text, 'news_used': len(heads)})
+
+def _alert_mkt(code):
+    otc = set(POPULAR_OTC) | {c for c, m in TECH_AI if m == 'otc'}
+    return 'otc' if code in otc else 'tse'
+
+@app.route('/api/alerts_list')
+def alerts_list():
+    """List the user's active 到價提醒 (proxied from the Val.town store)."""
+    url = os.environ.get('PNL_VAL_URL', '')
+    if not url:
+        return jsonify({'alerts': []})
+    return jsonify(cached_get(url.rstrip('/') + '/api/alerts', ttl=8, timeout=8) or {'alerts': []})
+
+@app.route('/api/alert_add', methods=['POST'])
+def alert_add():
+    """Add a 到價提醒 — infers market + direction (漲到/跌到) from the live price."""
+    url = os.environ.get('PNL_VAL_URL', '')
+    if not url:
+        return jsonify({'ok': False, 'msg': '提醒儲存未設定'})
+    b = request.get_json(force=True, silent=True) or {}
+    code = str(b.get('code', '')).strip()
+    try:
+        target = float(b.get('target'))
+    except (TypeError, ValueError):
+        return jsonify({'ok': False, 'msg': '目標價無效'})
+    if not code or target <= 0:
+        return jsonify({'ok': False, 'msg': '請輸入代碼與目標價'})
+    market = _alert_mkt(code)
+    cur, name = None, STOCK_NAMES.get(code, code)
+    for mk in (market, 'otc' if market == 'tse' else 'tse'):
+        for s in fetch_stocks([(code, mk)]):
+            if s and s.get('code') == code and s.get('price'):
+                cur, name, market = s['price'], (s.get('name') or name), s.get('market', mk)
+                break
+        if cur is not None:
+            break
+    if cur is None:
+        return jsonify({'ok': False, 'msg': '查無此股票即時報價'})
+    direction = 'up' if target >= cur else 'down'
+    try:
+        r = requests.post(url.rstrip('/') + '/api/alert',
+                          json={'secret': os.environ.get('PNL_SECRET', ''), 'code': code,
+                                'name': name, 'market': market, 'target': target, 'direction': direction},
+                          timeout=8)
+        ok = r.status_code == 200
+    except Exception:
+        ok = False
+    return jsonify({'ok': ok, 'direction': direction, 'current': cur, 'name': name})
+
+@app.route('/api/alert_del', methods=['POST'])
+def alert_del():
+    url = os.environ.get('PNL_VAL_URL', '')
+    b = request.get_json(force=True, silent=True) or {}
+    if url:
+        try:
+            requests.post(url.rstrip('/') + '/api/alert_del',
+                          json={'secret': os.environ.get('PNL_SECRET', ''), 'id': b.get('id')}, timeout=8)
+        except Exception:
+            pass
+    return jsonify({'ok': True})
+
+@app.route('/api/check_alerts')
+def check_alerts():
+    """Cron-only: check active 到價提醒 vs live prices; LINE-push hits + mark them."""
+    secret = os.environ.get('CRON_SECRET', '')
+    if secret and request.args.get('key', '') != secret and \
+            request.headers.get('Authorization', '') != f'Bearer {secret}':
+        return jsonify({'error': 'unauthorized'}), 401
+    url = os.environ.get('PNL_VAL_URL', '')
+    if not url:
+        return jsonify({'checked': 0})
+    data = cached_get(url.rstrip('/') + '/api/alerts', ttl=0, timeout=8) or {}
+    alerts = data.get('alerts', []) if isinstance(data, dict) else []
+    if not alerts:
+        return jsonify({'checked': 0, 'triggered': 0})
+    pairs = list({(str(a['code']), a.get('market', 'tse')) for a in alerts})
+    price = {}
+    for s in fetch_stocks(pairs):
+        if s and s.get('code') and s.get('price'):
+            price[s['code']] = s['price']
+    hits = []
+    for a in alerts:
+        cur = price.get(str(a['code']))
+        if cur is None:
+            continue
+        if (a['direction'] == 'up' and cur >= a['target']) or (a['direction'] == 'down' and cur <= a['target']):
+            hits.append((a, cur))
+    if hits:
+        lines = ['🔔 到價提醒']
+        for a, cur in hits:
+            arrow = '漲到' if a['direction'] == 'up' else '跌到'
+            lines.append(f"・{a['name']}({a['code']}) {arrow} {a['target']}　現價 {cur}")
+        _line_push('\n'.join(lines), len(hits))
+        for a, cur in hits:
+            try:
+                requests.post(url.rstrip('/') + '/api/alert_trigger',
+                              json={'secret': os.environ.get('PNL_SECRET', ''), 'id': a['id'], 'price': cur}, timeout=6)
+            except Exception:
+                pass
+    return jsonify({'checked': len(alerts), 'triggered': len(hits)})
+
+
+_intraday_cache = {}
+
+
+def _intraday_universe():
+    """Dedup union of POPULAR_TSE + POPULAR_OTC + TECH_AI as (code, market) pairs."""
+    out, seen = [], set()
+    for c in POPULAR_TSE:
+        if c not in seen:
+            seen.add(c); out.append((c, 'tse'))
+    for c in POPULAR_OTC:
+        if c not in seen:
+            seen.add(c); out.append((c, 'otc'))
+    for c, m in TECH_AI:
+        if c not in seen:
+            seen.add(c); out.append((c, m))
+    return out
+
+
+def _scan_intraday_alerts(pct=5.0):
+    """Scan the popular universe for intraday price anomalies: 漲停/跌停 (real limit
+    price, fallback ±9.8%), 大漲/大跌 (±pct%). One most-severe type per stock.
+    Only counts REAL matched trades that are fresh today — rejects z='-' estimated
+    prices (auction windows) and stale snapshots (holidays) to avoid false alerts.
+    Cached ~20s by pct."""
+    ck = round(pct, 1)
+    hit = _intraday_cache.get(ck)
+    if hit and time.time() - hit['t'] < 20:
+        return hit['data']
+    today = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).strftime('%Y%m%d')
+    out = []
+    for s in fetch_stocks(_intraday_universe()):
+        try:
+            cp = float(s.get('change_pct'))
+            y = float(s.get('yesterday') or 0)
+            price = float(s.get('price') or 0)
+        except (TypeError, ValueError):
+            continue
+        if not price or y <= 0:
+            continue
+        if not s.get('traded'):                   # z='-' estimate (auction) → not a real print
+            continue
+        if s.get('date') and str(s['date']) != today:   # stale snapshot (e.g. holiday)
+            continue
+        if s.get('change') == 0 and price == y:   # true flat
+            continue
+
+        def _flt(v):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+        lu, ld = _flt(s.get('limit_up')), _flt(s.get('limit_down'))
+        if lu is not None and price >= lu - 0.001:
+            t, icon = '漲停', '🔴'
+        elif ld is not None and price <= ld + 0.001:
+            t, icon = '跌停', '🟢'
+        elif lu is None and cp >= 9.8:            # fallback only when limit price absent
+            t, icon = '漲停', '🔴'
+        elif ld is None and cp <= -9.8:
+            t, icon = '跌停', '🟢'
+        elif cp >= pct:
+            t, icon = '大漲', '🔺'
+        elif cp <= -pct:
+            t, icon = '大跌', '🔻'
+        else:
+            continue
+        out.append({'code': s['code'], 'name': s.get('name', s['code']),
+                    'market': s.get('market', 'tse'), 'price': round(price, 2),
+                    'change_pct': round(cp, 2), 'type': t, 'icon': icon})
+    out.sort(key=lambda r: abs(r['change_pct']), reverse=True)
+    _intraday_cache[ck] = {'t': time.time(), 'data': out}
+    return out
+
+
+@app.route('/api/intraday_alerts')
+def intraday_alerts():
+    """盤中異動 list for the UI (no push, no dedup)."""
+    try:
+        pct = float(request.args.get('pct', '5'))
+    except ValueError:
+        pct = 5.0
+    pct = max(2.0, min(pct, 9.0))
+    tw = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+    open_now = tw.weekday() < 5 and (9 * 60) <= (tw.hour * 60 + tw.minute) <= (13 * 60 + 31)
+    return jsonify({'alerts': _scan_intraday_alerts(pct), 'pct': pct,
+                    'market_open': open_now, 'tw_time': tw.strftime('%H:%M')})
+
+
+@app.route('/api/check_intraday')
+def check_intraday():
+    """Cron-only: scan 盤中異動, LINE-push NEW anomalies (dedup per code+type+day
+    in the Val store), mark them seen. Market-hours gated (TW 09:00–13:31)."""
+    secret = os.environ.get('CRON_SECRET', '')
+    if secret and request.args.get('key', '') != secret and \
+            request.headers.get('Authorization', '') != f'Bearer {secret}':
+        return jsonify({'error': 'unauthorized'}), 401
+    tw = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+    hm = tw.hour * 60 + tw.minute
+    if tw.weekday() >= 5 or hm < 9 * 60 or hm > 13 * 60 + 31:
+        return jsonify({'skipped': 'market closed', 'tw_time': tw.strftime('%H:%M')})
+    try:
+        pct = float(request.args.get('pct', '5'))
+    except ValueError:
+        pct = 5.0
+    url = os.environ.get('PNL_VAL_URL', '')
+    if not url:
+        # No dedup store → we'd re-push the same anomalies every run (spam).
+        # Refuse to push without dedup; the UI endpoint still works.
+        return jsonify({'skipped': 'no dedup store (PNL_VAL_URL unset)'})
+    alerts = _scan_intraday_alerts(pct)
+    day = tw.strftime('%Y-%m-%d')
+    d = cached_get(url.rstrip('/') + '/api/intraday_seen?day=' + day, ttl=0, timeout=8) or {}
+    seen = set(d.get('seen', [])) if isinstance(d, dict) else set()
+    new = [a for a in alerts if f"{a['code']}:{a['type']}" not in seen]
+    pushed = False
+    if new:
+        lines = [f'⚡ 盤中異動提醒　{tw.strftime("%H:%M")}']
+        for a in new[:15]:
+            sign = '+' if a['change_pct'] >= 0 else ''
+            lines.append(f"{a['icon']} {a['name']}({a['code']}) {a['type']}　{a['price']}　{sign}{a['change_pct']}%")
+        res = _line_push('\n'.join(lines), len(new))
+        pushed = bool(res and res.get('pushed'))
+        try:
+            requests.post(url.rstrip('/') + '/api/intraday_mark',
+                          json={'secret': os.environ.get('PNL_SECRET', ''), 'day': day,
+                                'keys': [f"{a['code']}:{a['type']}" for a in new]}, timeout=8)
+        except Exception:
+            pass
+    return jsonify({'scanned': len(_intraday_universe()), 'found': len(alerts),
+                    'new': len(new), 'pushed': pushed, 'tw_time': tw.strftime('%H:%M')})
+
 
 @app.route('/api/recommend')
 def recommend():
@@ -2255,8 +2935,8 @@ def recommend():
                 'pe': round(pe, 1) if pe else None,
                 'pb': round(pb, 2) if pb else None,
                 'dividend_yield': round(dy, 2) if dy else None,
-                'rev_yoy': round(yoy, 1) if yoy else None,
-                'rev_mom': round(mom, 1) if mom else None,
+                'rev_yoy': round(yoy, 1) if yoy is not None else None,
+                'rev_mom': round(mom, 1) if mom is not None else None,
             })
 
     scored.sort(key=lambda x: x['score'], reverse=True)
@@ -2410,8 +3090,8 @@ def recommend_sell():
                 'pe': round(pe, 1) if pe else None,
                 'pb': round(pb, 2) if pb else None,
                 'dividend_yield': round(dy, 2) if dy else None,
-                'rev_yoy': round(yoy, 1) if yoy else None,
-                'rev_mom': round(mom, 1) if mom else None,
+                'rev_yoy': round(yoy, 1) if yoy is not None else None,
+                'rev_mom': round(mom, 1) if mom is not None else None,
             })
 
     scored.sort(key=lambda x: x['score'], reverse=True)
@@ -2567,7 +3247,7 @@ def watchlist_health():
             'buy_score': buy_score, 'sell_score': sell_score,
             'pe': round(pe, 1) if pe else None,
             'dividend_yield': round(dy, 2) if dy else None,
-            'rev_yoy': round(yoy, 1) if yoy else None,
+            'rev_yoy': round(yoy, 1) if yoy is not None else None,
             'alerts': alerts,
         })
     return jsonify(results)
@@ -3319,10 +3999,39 @@ def _bt_indicators(closes, highs, lows):
     hist = [dif[i] - dea[i] for i in range(n)]
     return rsi, k, d, hist
 
+def _bt_agg(trades):
+    """Aggregate a list of {ret,hold,win} trades into a performance summary."""
+    n = len(trades)
+    if not n:
+        return {'trades': 0, 'win_rate': 0, 'avg_return': 0, 'expectancy': 0,
+                'avg_win': 0, 'avg_loss': 0, 'best': 0, 'worst': 0,
+                'avg_hold_days': 0, 'win_count': 0, 'loss_count': 0}
+    wins = [t for t in trades if t['win']]
+    losses = [t for t in trades if not t['win']]
+    rets = [t['ret'] for t in trades]
+    avg = sum(rets) / n
+    aw = sum(t['ret'] for t in wins) / len(wins) if wins else 0
+    al = sum(t['ret'] for t in losses) / len(losses) if losses else 0
+    return {
+        'trades': n,
+        'win_rate': round(len(wins) / n * 100, 1),
+        'avg_return': round(avg, 2),
+        'avg_win': round(aw, 2), 'avg_loss': round(al, 2),
+        'expectancy': round(avg, 2),
+        'best': round(max(rets), 1), 'worst': round(min(rets), 1),
+        'avg_hold_days': round(sum(t['hold'] for t in trades) / n, 1),
+        'win_count': len(wins), 'loss_count': len(losses),
+    }
+
+
 def _backtest_signals(months=12, min_weight=6, max_hold=20):
-    """Walk historical data, fire the same bullish technical signals used live,
+    """Walk historical data, fire a price-only SUBSET of the live technical signals,
     simulate entry→stop/target/time-exit, and aggregate performance. No
-    look-ahead: signals at day i use only data up to i; entry at close[i]."""
+    look-ahead: signals at day i use only data up to i; entry at close[i].
+    Each trade is tagged `confirmed` (多頭排列: close>MA20>MA60) — the
+    historically-reconstructable proxy for 綜合推薦's multi-signal confirmation —
+    so we can compare the confirmed cohort's win-rate against the raw technical
+    core."""
     rng = '2y' if months > 12 else '1y'
     pairs = [(c, 'tse') for c in POPULAR_TSE[:30]] + [(c, 'otc') for c in POPULAR_OTC[:10]]
     from concurrent.futures import ThreadPoolExecutor
@@ -3339,7 +4048,7 @@ def _backtest_signals(months=12, min_weight=6, max_hold=20):
         n = len(closes)
         ma = lambda p, i: sum(closes[i - p + 1:i + 1]) / p if i >= p - 1 else None
         trades = []
-        i = 30
+        i = 60   # start at 60 so MA60 (多頭排列確認) is always computable — no cohort mislabel
         while i < n - 1:
             w = 0
             if rsi[i] is not None and rsi[i] <= 30: w += 3
@@ -3355,6 +4064,8 @@ def _backtest_signals(months=12, min_weight=6, max_hold=20):
                 av20 = sum(vols[i - 19:i + 1]) / 20
                 if av20 and vols[i] > av20 * 2 and closes[i] > closes[i - 1]: w += 3
             if w >= min_weight:
+                m60 = ma(60, i)
+                confirmed = bool(m20 and m60 and closes[i] > m20 > m60)
                 entry = closes[i]
                 trs = [max(highs[j] - lows[j], abs(highs[j] - closes[j - 1]), abs(lows[j] - closes[j - 1]))
                        for j in range(max(1, i - 13), i + 1)]
@@ -3373,7 +4084,8 @@ def _backtest_signals(months=12, min_weight=6, max_hold=20):
                 if outcome is None:
                     exit_i = min(i + max_hold, n - 1)
                     outcome = (closes[exit_i] - entry) / entry * 100
-                trades.append({'ret': outcome, 'hold': exit_i - i, 'win': outcome > 0})
+                trades.append({'ret': outcome, 'hold': exit_i - i, 'win': outcome > 0,
+                               'confirmed': confirmed, 'code': code})
                 i = exit_i + 1  # no overlapping trades on same stock
             else:
                 i += 1
@@ -3382,25 +4094,19 @@ def _backtest_signals(months=12, min_weight=6, max_hold=20):
     with ThreadPoolExecutor(max_workers=10) as pool:
         all_trades = [t for lst in pool.map(run, pairs) for t in lst]
 
-    n = len(all_trades)
-    if not n:
-        return {'trades': 0, 'months': months, 'min_weight': min_weight}
-    wins = [t for t in all_trades if t['win']]
-    losses = [t for t in all_trades if not t['win']]
-    rets = [t['ret'] for t in all_trades]
-    avg = sum(rets) / n
-    aw = sum(t['ret'] for t in wins) / len(wins) if wins else 0
-    al = sum(t['ret'] for t in losses) / len(losses) if losses else 0
-    return {
-        'trades': n, 'months': months, 'min_weight': min_weight,
-        'win_rate': round(len(wins) / n * 100, 1),
-        'avg_return': round(avg, 2),
-        'avg_win': round(aw, 2), 'avg_loss': round(al, 2),
-        'expectancy': round(avg, 2),
-        'best': round(max(rets), 1), 'worst': round(min(rets), 1),
-        'avg_hold_days': round(sum(t['hold'] for t in all_trades) / n, 1),
-        'win_count': len(wins), 'loss_count': len(losses),
-    }
+    if not all_trades:
+        return {'trades': 0, 'months': months, 'min_weight': min_weight,
+                'confirmed': _bt_agg([]), 'base_only': _bt_agg([]), 'stocks': 0}
+    confirmed = [t for t in all_trades if t.get('confirmed')]
+    base_only = [t for t in all_trades if not t.get('confirmed')]
+    out = _bt_agg(all_trades)
+    out.update({
+        'months': months, 'min_weight': min_weight,
+        'confirmed': _bt_agg(confirmed),
+        'base_only': _bt_agg(base_only),
+        'stocks': len({t['code'] for t in all_trades}),
+    })
+    return out
 
 @app.route('/api/signal_backtest')
 def signal_backtest():
@@ -3413,6 +4119,42 @@ def signal_backtest():
     except ValueError:
         mw = 6
     return jsonify(_backtest_signals(months, mw))
+
+
+_btbt_cache = {}
+
+
+@app.route('/api/topbuys_backtest')
+def topbuys_backtest():
+    """回測綜合推薦勝率: backtests the technical-entry core of 綜合推薦 (the only
+    historically-reconstructable pillar — it supplies the actual 進場/停損/目標
+    levels), and compares the multi-signal-confirmed cohort (多頭排列確認, a proxy
+    for 綜合推薦's multi-source agreement) against the raw technical core. Reuses
+    _backtest_signals; defaults min_weight to 5 to approximate _compute_top_buys'
+    cut (the live cut sums a broader signal set, so the backtested entry universe is
+    a stricter technical subset, not the identical live population).
+    Cached 6h per (months, min_weight) since historical daily data barely moves."""
+    try:
+        months = min(int(request.args.get('months', '12')), 24)
+    except ValueError:
+        months = 12
+    try:
+        mw = int(request.args.get('min_weight', '5'))
+    except ValueError:
+        mw = 5
+    ck = f'{months}:{mw}'
+    hit = _btbt_cache.get(ck)
+    if hit and time.time() - hit['t'] < 21600:
+        return jsonify(hit['data'])
+    res = _backtest_signals(months, mw)
+    res['note'] = ('回測「綜合推薦」可從歷史價格還原的技術進場核心（進場/停損/目標的實際來源）。'
+                   '新聞、法人、估值屬即時加權，無法回溯重現，故未納入回測。'
+                   '「多訊號確認」= 進場當天同時站上 MA20 且 MA20>MA60（多頭排列），'
+                   '是綜合推薦多方訊號一致性的歷史代理指標。進場價以訊號當日收盤價模擬，'
+                   '實際下單須等收盤確認、真實成交價可能不同。紙上模擬，不含手續費/滑價。')
+    if res.get('trades'):
+        _btbt_cache[ck] = {'t': time.time(), 'data': res}
+    return jsonify(res)
 
 @app.route('/api/entry_signals')
 def entry_signals():
@@ -3491,9 +4233,20 @@ def _compute_entry_signals():
         if s and s.get('code'):
             rt_map[s['code']] = s
 
+    # Pre-fetch ALL histories in PARALLEL. This was a serial loop (one network
+    # call per stock × 45 stocks ≈ 70s) — the single biggest reason the daily
+    # push was slow (~89s) and at risk of cron timeout. Parallel drops it to
+    # ~10-15s, making the scheduled push reliably fast.
+    from concurrent.futures import ThreadPoolExecutor
+    hist_map = {}
+    with ThreadPoolExecutor(max_workers=12) as _hpool:
+        for (code, _mk), hist in zip(scan_list,
+                                     _hpool.map(lambda cm: _fetch_hist(cm[0], cm[1], months=5), scan_list)):
+            hist_map[code] = hist
+
     for code, market in scan_list:
         try:
-            hist = _fetch_hist(code, market, months=5)
+            hist = hist_map.get(code) or []
             if len(hist) < 40:
                 continue
 
@@ -3629,11 +4382,14 @@ def _compute_entry_signals():
             entry_price = round(price, 2)
             entry_note = '現價進場'
             if rsi and rsi > 75:
+                # Floor the pullback entry so it can't sit absurdly far below
+                # price on a near-limit-up day (else MA5 can be ~20% below and
+                # the quoted entry is unreachable, inflating the risk/reward).
                 if _ma5 < price * 0.97:
-                    entry_price = round(_ma5, 2)
+                    entry_price = round(max(_ma5, price * 0.95), 2)
                     entry_note = '建議回測MA5再進場'
                 elif _ma10 < price * 0.95:
-                    entry_price = round(_ma10, 2)
+                    entry_price = round(max(_ma10, price * 0.92), 2)
                     entry_note = '建議回測MA10再進場'
                 else:
                     entry_price = round(price * 0.97, 2)
@@ -3677,20 +4433,13 @@ def _compute_entry_signals():
             _tgt_cands.append((_rr3, '風報比1:3'))
             if _ma60 and ep > _ma60:
                 _tgt_cands.append((round(ep * 1.10, 2), '趨勢延伸+10%'))
-            if ep < price * 0.95:
-                _tgt_cands.append((round(price, 2), '回測前高水準'))
             _tgt_cands.sort(key=lambda x: x[0])
             _min_tgt = ep + (ep - stop_loss) * 2
-            if ep < price * 0.95:
-                _min_tgt = max(_min_tgt, price)
             _good = [(t, n) for t, n in _tgt_cands if t >= _min_tgt and t <= ep * 1.50]
             if _good:
                 target, target_note = _good[0]
             else:
-                if ep < price * 0.95 and price > _rr2:
-                    target, target_note = round(price, 2), '回測前高水準'
-                else:
-                    target, target_note = _rr2, '風報比1:2'
+                target, target_note = _rr2, '風報比1:2'
 
             _risk = ep - stop_loss
             risk_reward = round((target - ep) / _risk, 1) if _risk > 0 else 0
@@ -4229,10 +4978,10 @@ def stock_signal():
     if rsi and rsi > 75:
         # Overbought — suggest waiting for pullback
         if ma5_val < price * 0.97:
-            entry_price = round(ma5_val, 2)
+            entry_price = round(max(ma5_val, price * 0.95), 2)
             entry_note = '建議回測MA5再進場'
         elif ma10_val < price * 0.95:
-            entry_price = round(ma10_val, 2)
+            entry_price = round(max(ma10_val, price * 0.92), 2)
             entry_note = '建議回測MA10再進場'
         else:
             entry_price = round(price * 0.97, 2)
@@ -4283,26 +5032,14 @@ def stock_signal():
     target_candidates.append((rr3_target, '風報比1:3'))
     if ma60_val and ep > ma60_val:
         target_candidates.append((round(ep * 1.10, 2), '趨勢延伸+10%'))
-    # When entry adjusted down (overbought), add current price as recovery target
-    if ep < price * 0.95:
-        target_candidates.append((round(price, 2), '回測前高水準'))
-
     target_candidates.sort(key=lambda x: x[0])
     min_target = ep + (ep - stop_loss) * 2
-    # When entry is adjusted down, minimum target should be at least the current price
-    if ep < price * 0.95:
-        min_target = max(min_target, price)
     good_targets = [(t, n) for t, n in target_candidates if t >= min_target and t <= ep * 1.50]
     if good_targets:
         target, target_note = good_targets[0]
     else:
-        # Fallback: use RR 1:2 or current price, whichever is higher
-        if ep < price * 0.95 and price > rr_target:
-            target = round(price, 2)
-            target_note = '回測前高水準'
-        else:
-            target = rr_target
-            target_note = '風報比1:2'
+        target = rr_target
+        target_note = '風報比1:2'
 
     risk = ep - stop_loss
     risk_reward = round((target - ep) / risk, 1) if risk > 0 else 0
@@ -4352,7 +5089,9 @@ def stock_signal():
     _fund_metrics = _fetch_fundamentals().get(code, {})
     buffett = buffett_score(_fund_metrics, pe, pb, dy, yoy, price)
     # 存股 (income / dividend) track record
-    dividend_quality = _dividend_quality(code, market, price, _fund_metrics.get('eps_annual'))
+    # Payout denominator: prefer real TTM EPS (price/PE) over annualized single-quarter EPS.
+    _eps_basis = (price / pe) if (pe and pe > 0 and price) else _fund_metrics.get('eps_annual')
+    dividend_quality = _dividend_quality(code, market, price, _eps_basis, exch_yield=dy)
 
     # ═══════════════════════════════════════════
     # PART 3: Institutional / Chip analysis (籌碼面)
@@ -4378,8 +5117,17 @@ def stock_signal():
             t86_results = list(pool.map(_fetch_t86, days))
 
         chip_daily = []
+        seen_dates = set()
         for chip_day, t86_data in t86_results:  # already newest-first
-            if not isinstance(t86_data, dict):
+            if not isinstance(t86_data, dict) or t86_data.get('stat') != 'OK':
+                continue
+            # Label the row with the data's OWN date from the payload, not the
+            # requested day — a no-data-yet request (today pre-close) returns the
+            # latest available day, which must not be relabelled as today and
+            # duplicated. Dedup by the real data date.
+            dd = str(t86_data.get('date', ''))
+            date_str = f'{dd[4:6]}/{dd[6:8]}' if (len(dd) == 8 and dd.isdigit()) else chip_day.strftime('%m/%d')
+            if date_str in seen_dates:
                 continue
             for row in t86_data.get('data', []):
                 if row[0].strip() == code:
@@ -4387,8 +5135,9 @@ def stock_signal():
                         foreign = int(row[4].replace(',', ''))
                         trust = int(row[10].replace(',', ''))
                         total = int(row[18].replace(',', ''))
-                        chip_daily.append({'date': chip_day.strftime('%m/%d'), 'foreign': foreign // 1000,
+                        chip_daily.append({'date': date_str, 'foreign': foreign // 1000,
                                            'trust': trust // 1000, 'total': total // 1000})
+                        seen_dates.add(date_str)
                         # Latest day → institutional snapshot (raw shares)
                         if inst is None:
                             inst = {'name': name, 'foreign': foreign, 'trust': trust, 'total': total}

@@ -463,10 +463,12 @@ body *{transition:background-color var(--transition-speed) ease,border-color var
 
 <div class="nav" id="nav">
   <button class="tab active" data-page="overview">📊 總覽</button>
+  <button class="tab" data-page="topbuys">⭐ 推薦</button>
   <button class="tab" data-page="ranking">🏅 排行</button>
   <button class="tab" data-page="momentum">🚀 動能</button>
   <button class="tab" data-page="portfolio">💰 持股</button>
   <button class="tab" data-page="alerts">🔔 提醒</button>
+  <button class="tab" data-page="moves">⚡ 異動</button>
   <button class="tab" data-page="chart">📈 K線</button>
   <button class="tab" data-page="institutional">🏦 法人</button>
   <button class="tab" data-page="sectors">🏭 類股</button>
@@ -478,11 +480,30 @@ body *{transition:background-color var(--transition-speed) ease,border-color var
   <button class="tab" data-page="etf">🏆 ETF</button>
   <button class="tab" data-page="signals">📡 訊號</button>
   <button class="tab" data-page="news">📰 新聞</button>
+  <button class="tab" data-page="gooaye">🎙 股癌</button>
   <button class="tab" data-page="search">🔍 查詢</button>
 </div>
 
 <div class="pull-indicator" id="pull-ind">↻ 下拉刷新</div>
 <div class="main">
+
+<div class="page" id="page-topbuys">
+  <div class="stitle">⭐ 今日綜合推薦 <span style="font-size:11px;color:var(--dim);font-weight:400">融合「技術進場＋利多新聞＋科技動能＋估值便宜」最新訊號 · 多訊號同時命中＝強度高 · 僅供參考</span></div>
+  <div id="tb-winrate-box" style="background:var(--card);border-radius:12px;padding:12px 14px;margin-bottom:14px">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap">
+      <div style="font-weight:700">📊 這套推薦的歷史勝率回測 <span style="font-size:11px;color:var(--dim);font-weight:400">回測技術進場核心 · 過去真的會賺嗎？</span></div>
+      <button id="tb-wr-btn" onclick="loadWinrate()" style="background:var(--gold);color:#000;border:none;border-radius:8px;padding:7px 14px;font-weight:700;cursor:pointer">回測過去 12 個月 ▶</button>
+    </div>
+    <div id="tb-winrate"></div>
+  </div>
+  <div id="topbuys-list"><div class="loading"><span class="spin">↻</span> 綜合最新訊號中，約需 10~20 秒...</div></div>
+</div>
+
+<div class="page" id="page-moves">
+  <div class="stitle">⚡ 盤中異動 <span style="font-size:11px;color:var(--dim);font-weight:400">熱門股即時急拉／急殺／漲跌停 · 開盤中每分鐘更新 · 觸發自動推 LINE</span></div>
+  <div id="moves-status" style="font-size:12px;color:var(--dim);margin-bottom:8px"></div>
+  <div id="moves-list"><div class="loading"><span class="spin">↻</span> 掃描盤中異動中...</div></div>
+</div>
 
 <div class="page active" id="page-overview">
   <div id="tech-section" style="display:none;margin-bottom:16px">
@@ -599,13 +620,13 @@ body *{transition:background-color var(--transition-speed) ease,border-color var
 
 <div class="page" id="page-alerts">
   <div class="stitle">🔔 股價到價提醒</div>
-  <p style="color:var(--dim);font-size:12px;margin-bottom:10px">設定目標價，到價時自動跳通知提醒</p>
+  <p style="color:var(--dim);font-size:12px;margin-bottom:10px">設定目標價，<b style="color:var(--gold)">到價自動推 LINE 給你</b>（盤中每 5 分鐘檢查，不用開 app）。漲／跌方向依現價自動判斷。</p>
   <div class="addbar">
-    <input class="inp" id="a-code" placeholder="代碼" style="max-width:100px">
-    <select class="inp" id="a-dir"><option value="above">漲到 ≥</option><option value="below">跌到 ≤</option></select>
-    <input class="inp" id="a-price" type="number" placeholder="目標價" style="max-width:100px">
-    <button class="btn" onclick="addAlert()">+ 設定</button>
+    <input class="inp" id="a-code" placeholder="股票代碼，例如 2330" style="max-width:170px">
+    <input class="inp" id="a-price" type="number" step="any" placeholder="目標價" style="max-width:110px">
+    <button class="btn" onclick="addAlert()">+ 設定提醒</button>
   </div>
+  <div id="a-msg" style="font-size:12px;margin:6px 0;min-height:16px"></div>
   <div id="a-list"></div>
 </div>
 
@@ -783,6 +804,7 @@ body *{transition:background-color var(--transition-speed) ease,border-color var
 
 <div class="page" id="page-signals">
   <div class="stitle">📡 進場點位訊號</div>
+  <div id="pnl-panel" style="margin-bottom:14px;display:none"></div>
   <div class="addbar" style="margin-bottom:12px">
     <input class="inp" id="sig-inp" placeholder="輸入股票代碼查詢進場訊號，例如：2330、3661" style="flex:1;max-width:300px" onkeypress="if(event.key==='Enter')querySignal()">
     <button class="btn" onclick="querySignal()">查詢訊號</button>
@@ -835,6 +857,10 @@ body *{transition:background-color var(--transition-speed) ease,border-color var
     <span id="news-updated"></span>
   </div>
   <div id="news-list"><div class="loading"><span class="spin">↻</span> 載入新聞中...</div></div>
+</div>
+
+<div class="page" id="page-gooaye">
+  <div id="gooaye-wrap"><div class="loading"><span class="spin">↻</span> 載入股癌專頁中...</div></div>
 </div>
 
 <div class="page" id="page-search">
@@ -917,13 +943,16 @@ document.querySelectorAll('.tab').forEach(t=>t.addEventListener('click',()=>{
   if(pg==='dividend')loadDiv();
   if(pg==='portfolio')loadPortfolio();
   if(pg==='alerts')renderAlerts();
+  if(pg==='moves')loadMoves(); else stopMoves();
   if(pg==='momentum')loadMomentum();
   if(pg==='ranking')loadRanking();
   if(pg==='dca')$('dca-code').focus();
   if(pg==='margin')loadMargin();
   if(pg==='backtest')$('bt-codes').focus();
-  if(pg==='signals')loadSignals();
+  if(pg==='signals'){loadSignals();loadPnlStats();}
   if(pg==='news')loadNews(currentNewsQuery);
+  if(pg==='gooaye')loadGooaye();
+  if(pg==='topbuys')loadTopBuys();
   if(pg==='search'){$('s-popular').style.display='block';$('s-res').style.display='none';$('s-inp').focus()}
 }));
 
@@ -2290,6 +2319,63 @@ async function runSignalBacktest(){
   }catch(e){el.innerHTML='<div style="color:var(--red);padding:16px">回測失敗，請稍後再試</div>'}
 }
 
+async function loadWinrate(mo){
+  const el=$('tb-winrate'); if(!el)return;
+  const months=mo||12;
+  const btn=$('tb-wr-btn'); if(btn)btn.style.display='none';
+  el.innerHTML='<div class="loading" style="padding:14px"><span class="spin">↻</span> 回測這套推薦過去 '+months+' 個月的每次進場（首次約 30~50 秒，之後秒回）…</div>';
+  try{
+    const r=await fetch('/api/topbuys_backtest?months='+months);
+    const d=await r.json();
+    if(!d.trades){el.innerHTML='<div style="color:var(--dim);padding:16px;text-align:center">資料不足，無法回測</div>';return}
+    const c=d.confirmed||{}, b=d.base_only||{};
+    const head=c.trades>=20?c:d;          // 多訊號確認 cohort if it has enough samples, else fall back to全部
+    const headLabel=c.trades>=20?'綜合推薦（多訊號確認）':'技術進場核心';
+    const posExp=head.expectancy>=0;
+    const wc=head.win_rate>=50?'var(--red)':'var(--gold)';
+    const ec=posExp?'var(--red)':'var(--green)';
+    const cell=(label,val,color)=>`<div style="background:var(--bg);border-radius:10px;padding:11px;text-align:center"><div style="font-size:11px;color:var(--dim)">${label}</div><div style="font-size:19px;font-weight:800;${color?'color:'+color:''}">${val}</div></div>`;
+    const moBtn=(m)=>`<button onclick="loadWinrate(${m})" style="background:${m===months?'var(--gold)':'var(--bg)'};color:${m===months?'#000':'var(--dim)'};border:1px solid var(--line);border-radius:6px;padding:4px 10px;font-size:12px;font-weight:600;cursor:pointer">${m} 個月</button>`;
+    // comparison: does 多訊號確認 beat 未確認? (require enough samples on BOTH sides)
+    const lift=(c.trades>=20&&b.trades>=20)?(c.win_rate-b.win_rate):null;
+    const bar=(label,wr,n,hl)=>`<div style="display:flex;align-items:center;gap:8px;margin:4px 0">
+      <div style="width:104px;font-size:12px;color:${hl?'var(--gold)':'var(--dim)'};font-weight:${hl?'700':'400'}">${label}</div>
+      <div style="flex:1;background:var(--bg);border-radius:6px;height:18px;overflow:hidden"><div style="width:${Math.min(wr,100)}%;height:100%;background:${hl?'var(--gold)':'var(--line)'}"></div></div>
+      <div style="width:84px;text-align:right;font-size:12px"><b style="${hl?'color:var(--gold)':''}">${wr}%</b> <span style="color:var(--dim)">(${n})</span></div></div>`;
+    el.innerHTML=`
+      <div style="font-size:11px;color:var(--dim);margin:8px 0 6px">模擬熱門股近 ${d.months} 個月、${d.stocks} 檔：每次出現<b>技術進場訊號</b>就買，到停損／目標價／到期出場。（新聞／法人／估值無法回溯，未納入）</div>
+      <div style="font-size:11px;color:var(--gold);font-weight:600;margin-bottom:6px">${headLabel}</div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(96px,1fr));gap:7px">
+        ${cell('進場次數',head.trades)}
+        ${cell('勝率',head.win_rate+'%',wc)}
+        ${cell('每筆期望',(posExp?'+':'')+head.expectancy+'%',ec)}
+        ${cell('平均賺','+'+head.avg_win+'%','var(--red)')}
+        ${cell('平均賠',head.avg_loss+'%','var(--green)')}
+        ${cell('平均持有',head.avg_hold_days+' 天')}
+      </div>
+      ${head.trades<40?`<div style="font-size:11px;color:var(--gold);margin-top:6px">⚠️ 樣本僅 ${head.trades} 筆，數量偏少、統計誤差較大，僅供參考。</div>`:''}
+      <div style="font-size:11px;color:var(--dim);margin:12px 0 4px">📊 多訊號一致性比較（勝率）</div>
+      ${bar('多訊號確認',c.win_rate||0,c.trades||0,true)}
+      ${bar('單一技術',b.win_rate||0,b.trades||0,false)}
+      ${lift!==null?`<div style="margin-top:8px;padding:9px 11px;border-radius:8px;background:${lift>0?'rgba(255,77,106,.08)':'rgba(255,255,255,.04)'};font-size:12px;line-height:1.6">
+        ${lift>0
+          ? `✅ <b>本期樣本中，多訊號一致組的歷史勝率高 ${Math.abs(lift).toFixed(1)} 個百分點</b>（${c.win_rate}% vs ${b.win_rate}%），與「綜合推薦把多方訊號同時命中排在前面」的邏輯一致（樣本內結果，非保證）。`
+          : `本期樣本中，多訊號一致組與單一技術勝率接近（${c.win_rate}% vs ${b.win_rate}%），確認效果不明顯。`}</div>`
+        :`<div style="margin-top:8px;font-size:11px;color:var(--dim)">兩組樣本不足（各需 ≥20 筆），暫不比較確認效果。</div>`}
+      <div style="display:flex;gap:14px;justify-content:center;margin-top:10px;font-size:11px;color:var(--dim)">
+        <span>✅ 賺 ${head.win_count} 次</span><span>❌ 賠 ${head.loss_count} 次</span>
+        <span>最佳 +${head.best}%</span><span>最差 ${head.worst}%</span>
+      </div>
+      <div style="margin-top:10px;padding:10px;border-radius:8px;background:${posExp?'rgba(255,77,106,.08)':'rgba(0,214,143,.08)'};font-size:12px;line-height:1.6">
+        ${posExp
+          ? `📈 <b>${headLabel}・歷史回測期望值為正</b>：每筆平均 +${head.expectancy}%、勝率約 ${head.win_rate}%，且「賺的(+${head.avg_win}%)比賠的(${head.avg_loss}%)多」——關鍵在紀律執行停損停利（樣本內結果，不代表未來）。`
+          : `⚠️ <b>${headLabel}・歷史回測期望值偏弱</b>（每筆平均 ${head.expectancy}%）：建議提高訊號門檻或謹慎使用。`}
+      </div>
+      <div style="display:flex;gap:6px;justify-content:center;margin-top:10px">${moBtn(6)}${moBtn(12)}${moBtn(24)}</div>
+      <div style="font-size:10px;color:var(--dim);margin-top:8px;line-height:1.5">※ ${d.note||''}過去績效不代表未來，僅供參考。</div>`;
+  }catch(e){el.innerHTML='<div style="color:var(--red);padding:16px">回測失敗，請稍後再試</div>'}
+}
+
 async function querySignal(){
   const code=$('sig-inp').value.trim();
   if(!code){$('sig-inp').focus();return}
@@ -2395,13 +2481,13 @@ async function querySignal(){
       const b=s.buffett;
       const bvc={'🎩':'#10b981','🟢':'#10b981','🟡':'#f5b731','⚪':'#6b7fa3','🔴':'#ef4444'}[b.verdict_icon]||'#6b7fa3';
       const m=[];
-      if(b.roe!=null)m.push(`ROE <b>${b.roe}%</b>`);
+      if(b.roe!=null)m.push(`ROE <b>${b.roe}%</b>${b.roe_est?'<span style="font-size:9px;color:var(--dim)">(年化估)</span>':''}`);
       if(!b.is_financial){
         if(b.gross_margin!=null)m.push(`毛利率 <b>${b.gross_margin}%</b>`);
         if(b.net_margin!=null&&b.net_margin<=100)m.push(`淨利率 <b>${b.net_margin}%</b>`);
         if(b.debt_ratio!=null)m.push(`負債比 <b>${b.debt_ratio}%</b>`);
       }else if(b.book_value!=null){m.push(`每股淨值 <b>${b.book_value}</b>`);}
-      if(b.eps!=null)m.push(`EPS <b>${b.eps}</b>${b.period?' ('+b.period+')':''}`);
+      if(b.eps!=null){const q4=(b.period||'').endsWith('Q4');m.push(`${q4?'EPS':'單季EPS'} <b>${b.eps}</b>${b.period?' ('+b.period+')':''}${(!q4&&b.eps_annual!=null)?`<span style="font-size:9px;color:var(--dim)"> · 年化 ${b.eps_annual}</span>`:''}`);}
       let fairHtml='';
       if(b.fair_price!=null&&b.margin_of_safety!=null){
         const mos=b.margin_of_safety, under=mos>=0;
@@ -2522,10 +2608,169 @@ async function querySignal(){
         ${s.k!=null?`<span class="sig-ind">K <span>${s.k}</span> D <span>${s.d}</span></span>`:''}
         ${s.macd_hist!=null?`<span class="sig-ind">MACD <span style="color:${s.macd_hist>=0?'var(--green)':'var(--red)'}">DIF ${s.dif} / DEA ${s.dem} / 柱 ${s.macd_hist>=0?'+':''}${s.macd_hist}</span></span>`:''}
       </div>
+      <div style="margin-top:12px"><button class="btn" onclick="askAI()" style="width:100%;font-size:13px;padding:11px">🤖 問 AI：這檔現在能不能買？</button><div id="ai-result" style="margin-top:8px"></div></div>
     </div>`;
+    window.lastSig=s;
   }catch(e){el.innerHTML='<div class="sig-card" style="color:var(--red);padding:16px">查詢失敗，請確認股票代碼</div>'}
 }
+async function askAI(){
+  const s=window.lastSig, out=$('ai-result'); if(!s||!out)return;
+  out.innerHTML='<div class="loading"><span class="spin">↻</span> AI 分析中（讀數據＋最新新聞）...</div>';
+  const parts=[`現價 ${s.price}（${s.change_pct>=0?'+':''}${s.change_pct}%）`];
+  if(s.verdict)parts.push(`綜合評等：${s.verdict_icon||''}${s.verdict}`);
+  const f=[];
+  if(s.pe!=null)f.push(`PE ${s.pe}`); if(s.pb!=null)f.push(`PB ${s.pb}`);
+  if(s.dividend_yield!=null)f.push(`殖利率 ${s.dividend_yield}%`);
+  if(s.rev_yoy!=null)f.push(`營收年增 ${s.rev_yoy}%`);
+  if(f.length)parts.push('基本面：'+f.join('、'));
+  if(s.buffett&&s.buffett.roe!=null)parts.push(`ROE ${s.buffett.roe}%`+(s.buffett.fair_price!=null?`、合理價 ${s.buffett.fair_price}（${s.buffett.margin_of_safety>=0?'低估':'偏貴'} ${s.buffett.margin_of_safety}%）`:''));
+  const techs=(s.signals||[]).map(x=>x.type).slice(0,6);
+  if(techs.length)parts.push('技術訊號：'+techs.join('、'));
+  parts.push(`評分 技術/基本/籌碼/散戶：${s.tech_score||0}/${s.fund_score||0}/${s.chip_score||0}/${s.sent_score||0}`);
+  parts.push(`建議進場 ${s.entry}｜停損 ${s.stop_loss}｜目標 ${s.target}（風報比 1:${s.risk_reward}）`);
+  if(s.dividend_quality)parts.push(`存股：連配 ${s.dividend_quality.consecutive_years} 年、${s.dividend_quality.verdict}`);
+  try{
+    const r=await fetch('/api/ai_analysis',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:s.code,name:s.name,summary:parts.join('\n')})});
+    const d=await r.json();
+    if(!d.ok){out.innerHTML=`<div style="padding:12px;background:var(--card2);border:1px solid var(--border);border-radius:8px;font-size:12px;color:var(--gold);line-height:1.6">${(d.msg||'AI 暫時無法使用')}</div>`;return}
+    const html=String(d.analysis).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/\n/g,'<br>');
+    out.innerHTML=`<div style="padding:14px;background:var(--card2);border:1px solid var(--border);border-radius:10px">
+      <div style="font-size:12px;font-weight:700;color:var(--gold);margin-bottom:8px">🤖 AI 體檢 · ${s.name}</div>
+      <div style="font-size:13px;line-height:1.75">${html}</div></div>`;
+  }catch(e){out.innerHTML='<div style="color:var(--red);padding:10px">AI 分析失敗</div>'}
+}
 
+async function loadTopBuys(){
+  const el=$('topbuys-list'); if(!el) return;
+  try{
+    const r=await fetch('/api/top_buys'); const d=await r.json();
+    if(!Array.isArray(d)||!d.length){el.innerHTML='<div style="color:var(--dim);padding:30px;text-align:center">目前沒有明確的推薦標的</div>';return}
+    const sc={'技術進場':'var(--blue)','利多新聞':'var(--gold)','科技動能':'var(--purple)','估值便宜':'var(--green)'};
+    const cards=d.map((x,i)=>{
+      const chg=Number(x.change_pct)||0, cc=chg>0?'var(--red)':chg<0?'var(--green)':'var(--dim)';
+      const badges=(x.sources||[]).map(s=>`<span class="tbb" style="color:${sc[s]||'var(--dim)'};border-color:${sc[s]||'var(--border)'}">${s}</span>`).join('');
+      const reasons=(x.reasons||[]).map(rs=>`<div>· ${rs}</div>`).join('');
+      const lv=x.entry?`<div class="tbl"><span>進場 <b>${x.entry}</b></span><span>停損 <b style="color:var(--green)">${x.stop_loss}</b></span><span>目標 <b style="color:var(--red)">${x.target}</b></span>${x.risk_reward?`<span>風報比 <b>1:${x.risk_reward}</b></span>`:''}</div>`:'';
+      const stars='●'.repeat(Math.min(x.n_sources,3))+'○'.repeat(Math.max(0,3-x.n_sources));
+      return `<div class="tbcard" onclick="openGooayeStock('${x.code}')" title="點看完整分析">
+        <div class="tbhead"><span class="tbrank">${i+1}</span>
+          <div style="flex:1"><div><b style="font-size:15px">${x.name}</b> <span style="color:var(--dim);font-size:12px">${x.code}</span></div>
+          <div style="font-size:11px;color:var(--dim)">${x.n_sources} 個訊號命中　<span style="letter-spacing:1px;color:var(--gold)">${stars}</span></div></div>
+          <div style="text-align:right"><div style="font-size:15px;font-weight:700">${x.price}</div><div style="font-size:12px;color:${cc}">${chg>0?'+':''}${chg.toFixed(2)}%</div></div>
+        </div>
+        <div class="tbbw">${badges}</div>
+        <div class="tbrs">${reasons}</div>${lv}</div>`;
+    }).join('');
+    el.innerHTML=`<style>
+      #topbuys-list{display:flex;flex-direction:column;gap:10px}
+      .tbcard{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:13px 14px;cursor:pointer;transition:border-color .15s}
+      .tbcard:hover{border-color:var(--gold)}
+      .tbhead{display:flex;align-items:center;gap:11px;margin-bottom:9px}
+      .tbrank{font-size:16px;font-weight:800;color:var(--gold);min-width:22px;text-align:center}
+      .tbbw{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:7px}
+      .tbb{font-size:11px;font-weight:600;border:1px solid;border-radius:6px;padding:2px 8px;background:transparent}
+      .tbrs{font-size:11px;color:var(--dim);line-height:1.6;margin-bottom:7px}
+      .tbl{display:flex;flex-wrap:wrap;gap:12px;font-size:12px;color:var(--dim);background:var(--card2);border-radius:8px;padding:8px 10px}
+      .tbl b{color:var(--text)}
+    </style>
+    <div style="font-size:11px;color:var(--dim);margin-bottom:10px">多訊號同時命中＝越強（●＝命中訊號數）· 點卡片看完整分析 · <b style="color:var(--red)">僅供參考，不構成投資建議</b></div>
+    ${cards}`;
+  }catch(e){el.innerHTML='<div style="color:var(--red);padding:16px">載入失敗</div>'}
+}
+async function loadGooaye(){
+  const el=$('gooaye-wrap'); if(!el) return;
+  const esc=s=>String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+  try{
+    const r=await fetch('/api/gooaye'); const d=await r.json();
+    const groups=(d&&d.groups)||[];
+    if(!groups.length){el.innerHTML='<div style="color:var(--dim);padding:30px;text-align:center">尚無資料，貼上股癌重點我就幫你排好 🐂</div>';return}
+    const keyOf=(str,isTw)=>{const m=isTw?String(str).match(/(\d{4,6})/):String(str).match(/([A-Za-z]{2,6})\s*$/);return m?(isTw?m[1]:m[1].toUpperCase()):null;};
+    const renderPill=(str,cls)=>{
+      const isTw=cls==='tw', key=keyOf(str,isTw), q=(key&&d.live)?d.live[key]:null;
+      let quote='';
+      if(q&&q.price!=null){const c=Number(q.change_pct)||0, qc=c>0?'qup':c<0?'qdn':'qflat';
+        quote=`<span class="gq ${qc}">${q.price} ${c>0?'+':''}${c.toFixed(2)}%</span>`;}
+      const hasSig=isTw&&key&&(d.signals||[]).includes(key);
+      const click=isTw&&key?`onclick="openGooayeStock('${key}')" style="cursor:pointer" title="點看完整分析"`:'';
+      return `<span class="gp ${cls}" ${click}><span class="gpn">${esc(str)}</span>${quote}${hasSig?'<span class="gsig" title="今天 app 也觸發進場訊號">📊</span>':''}</span>`;
+    };
+    const pills=(arr,cls)=>(arr||[]).map(s=>renderPill(s,cls)).join('');
+    const grp=g=>`<div class="gg">
+      <div class="gh"><span class="gi">${esc(g.icon||'')}</span><span>${esc(g.label||'')}</span></div>
+      ${g.tw&&g.tw.length?`<div class="gr"><span class="gl">台股</span><div class="gpw">${pills(g.tw,'tw')}</div></div>`:''}
+      ${g.us&&g.us.length?`<div class="gr"><span class="gl">美股</span><div class="gpw">${pills(g.us,'us')}</div></div>`:''}
+      ${g.source?`<div class="gs">來源：${esc(g.source)}</div>`:''}</div>`;
+    const metas=[d.updated&&('最新 '+d.updated),d.coverage,d.period].filter(Boolean);
+    const lv=Object.values(d.live||{}), up=lv.filter(x=>(x.change_pct||0)>0).length, dn=lv.filter(x=>(x.change_pct||0)<0).length, sigN=(d.signals||[]).length;
+    const summary=lv.length?`<div class="gsum">📈 即時行情：<b style="color:var(--red)">${up} 漲</b> · <b style="color:var(--green)">${dn} 跌</b>${sigN?`　·　<span style="color:var(--gold)">📊 ${sigN} 檔今天同時觸發 app 進場訊號</span>`:''}<div style="font-size:10px;margin-top:3px;opacity:.8">點台股標籤可看完整分析 · 報價自動更新</div></div>`:'';
+    el.innerHTML=`<style>
+      #gooaye-wrap{max-width:680px;margin:0 auto}
+      .gbadge{display:inline-flex;gap:6px;align-items:center;font-size:12px;color:var(--gold);background:var(--card2);border:1px solid var(--border);padding:5px 11px;border-radius:8px}
+      .gtitle{font-size:22px;font-weight:800;margin:12px 0 5px}
+      .gsub{font-size:13px;color:var(--dim);line-height:1.6;margin-bottom:12px}
+      .gmeta{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:14px}
+      .gmeta span{font-size:11px;color:var(--dim);border:1px solid var(--border);padding:3px 9px;border-radius:8px}
+      .gsum{font-size:12px;color:var(--dim);background:var(--card2);border:1px solid var(--border);border-radius:10px;padding:9px 12px;margin-bottom:14px;line-height:1.5}
+      .gcard{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px}
+      .gg{padding:14px 0;border-top:1px solid var(--border)} .gg:first-child{border-top:0;padding-top:0}
+      .gh{display:flex;align-items:center;gap:7px;font-size:14px;font-weight:700;margin-bottom:10px}
+      .gi{font-size:16px}
+      .gr{display:flex;gap:9px;margin-bottom:7px}
+      .gl{font-size:10px;color:var(--dim);min-width:26px;padding-top:5px}
+      .gpw{display:flex;flex-wrap:wrap;gap:6px;flex:1}
+      .gp{font-size:12px;padding:4px 9px;border-radius:8px;white-space:nowrap;display:inline-flex;align-items:center;gap:6px}
+      .gp.tw{background:rgba(59,130,246,.15);color:#7fb0ff;border:1px solid rgba(59,130,246,.32)}
+      .gp.tw:hover{border-color:#7fb0ff;background:rgba(59,130,246,.24)}
+      .gp.us{background:rgba(245,183,49,.13);color:var(--gold);border:1px solid rgba(245,183,49,.3)}
+      .gpn{font-weight:500} .gq{font-size:11px;font-weight:700} .gsig{font-size:11px}
+      .qup{color:var(--red)} .qdn{color:var(--green)} .qflat{color:var(--dim)}
+      .gs{font-size:11px;color:var(--dim);line-height:1.55;margin-top:8px}
+      .gfoot{font-size:10px;color:var(--dim);text-align:center;margin-top:14px;line-height:1.5}
+    </style>
+      <div class="gbadge">🎙 PODCAST 產業重點摘要</div>
+      <div class="gtitle">${esc(d.title||'股癌 專頁')}</div>
+      ${d.subtitle?`<div class="gsub">${esc(d.subtitle)}</div>`:''}
+      ${metas.length?`<div class="gmeta">${metas.map(x=>`<span>${esc(x)}</span>`).join('')}</div>`:''}
+      ${summary}
+      <div class="gcard">${groups.map(grp).join('')}</div>
+      <div class="gfoot">紅漲綠跌（含美股）· 即時報價自動更新；股癌觀點摘要僅供參考、不構成投資建議。</div>`;
+  }catch(e){el.innerHTML='<div style="color:var(--red);padding:16px">載入失敗</div>'}
+}
+function openGooayeStock(code){
+  const tab=document.querySelector('button.tab[data-page="signals"]'); if(tab)tab.click();
+  setTimeout(()=>{const i=$('sig-inp'); if(i)i.value=code; if(typeof querySignal==='function')querySignal();},80);
+}
+async function loadPnlStats(){
+  const el=$('pnl-panel'); if(!el) return;
+  try{
+    const r=await fetch('/api/pnl_stats'); const d=await r.json();
+    if(!d.enabled){el.style.display='none';return}
+    const s=d.stats||{};
+    const has=(s.closed_count||0)>0;
+    const cls=v=>(v>0?'color:var(--red)':v<0?'color:var(--green)':'color:var(--dim)');
+    const sg=v=>{const n=Number(v)||0;return (n>0?'+':n<0?'−':'')+Math.abs(n).toFixed(2)+'%'};
+    const chip=(k,val,sub)=>`<div style="flex:1;min-width:76px;background:var(--card2);border:1px solid var(--border);border-radius:10px;padding:8px 10px">
+        <div style="font-size:10px;color:var(--dim);margin-bottom:3px">${k}</div>
+        <div style="font-size:17px;font-weight:800">${val}</div>
+        ${sub?`<div style="font-size:10px;color:var(--dim);margin-top:2px">${sub}</div>`:''}</div>`;
+    el.innerHTML=`<div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:12px 14px">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+        <div style="font-size:14px;font-weight:800">📊 累計戰績</div>
+        <span style="font-size:10px;color:var(--dim);border:1px solid var(--border);border-radius:999px;padding:1px 8px">紙上模擬</span>
+        <span style="flex:1"></span>
+        <a href="${d.dashboard_url}" target="_blank" rel="noopener" style="font-size:11px;color:var(--blue);text-decoration:none">看完整戰績 ↗</a>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        ${chip('勝率', has?(Number(s.win_rate).toFixed(1)+'%'):'—', `${s.wins||0}勝 / ${s.losses||0}敗`)}
+        ${chip('累積報酬', `<span style="${cls(s.total_pnl_pct)}">${has?sg(s.total_pnl_pct):'—'}</span>`, '已平倉加總')}
+        ${chip('每筆期望', `<span style="${cls(s.avg_pnl_pct)}">${has?sg(s.avg_pnl_pct):'—'}</span>`, '平均每筆')}
+        ${chip('持有中', (s.open_count||0), `未實現 <span style="${cls(s.open_unreal_pct)}">${s.open_count?sg(s.open_unreal_pct):'—'}</span>`)}
+      </div>
+      <div style="font-size:10px;color:var(--dim);margin-top:9px">每日 9:30 推播的強訊號自動建倉，觸及停損/停利/到期自動平倉。未計手續費，僅供參考。</div>
+    </div>`;
+    el.style.display='block';
+  }catch(e){el.style.display='none'}
+}
 async function loadSignals(){
   const el=$('sig-list');
   el.innerHTML='<div class="loading"><span class="spin">↻</span> 掃描技術訊號中，約需 15 秒...</div>';
@@ -2638,51 +2883,64 @@ async function loadDailySummary(){
 }
 
 // ── Price Alert Push (到價提醒) ──
-let priceAlerts=(()=>{try{return JSON.parse(localStorage.getItem('priceAlerts')||'[]')}catch(e){return[]}})();
-function addAlert(){
-  const code=$('a-code').value.trim();
-  const dir=$('a-dir').value;
-  const price=parseFloat($('a-price').value);
-  if(!code||!price){toast('請輸入代碼和目標價','error');return}
-  priceAlerts.push({code,dir,price,id:Date.now()});
-  localStorage.setItem('priceAlerts',JSON.stringify(priceAlerts));
-  $('a-code').value='';$('a-price').value='';
-  toast(`已設定 ${code} ${dir==='above'?'≥':'≤'} ${price} 提醒`,'success');
-  renderAlerts();
-}
-function removeAlert(id){
-  priceAlerts=priceAlerts.filter(a=>a.id!==id);
-  localStorage.setItem('priceAlerts',JSON.stringify(priceAlerts));
-  renderAlerts();
-}
-function renderAlerts(){
-  if(!priceAlerts.length){$('a-list').innerHTML='<div style="color:var(--dim);padding:20px;text-align:center">尚未設定任何提醒<br><span style="font-size:12px">設定後，當股價達到目標價將自動推播通知</span></div>';return}
-  $('a-list').innerHTML=priceAlerts.map(a=>`<div class="alert-item">
-    <div><span style="font-weight:700">${a.code}</span> <span style="color:var(--dim);font-size:12px">${a.dir==='above'?'漲到 ≥':'跌到 ≤'} ${a.price}</span></div>
-    <button class="alert-del" onclick="removeAlert(${a.id})">✕</button>
-  </div>`).join('');
-}
-// Check price alerts periodically
-async function checkPriceAlerts(){
-  if(!priceAlerts.length)return;
+async function addAlert(){
+  const code=$('a-code').value.trim(), target=parseFloat($('a-price').value), msg=$('a-msg');
+  if(!code||!target){if(msg){msg.style.color='var(--red)';msg.textContent='請輸入代碼和目標價'}return}
+  if(msg){msg.style.color='var(--dim)';msg.textContent='設定中...'}
   try{
-    const r=await fetch('/api/price_check?alerts='+encodeURIComponent(JSON.stringify(priceAlerts)));
+    const r=await fetch('/api/alert_add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code,target})});
     const d=await r.json();
-    if(d.triggered&&d.triggered.length){
-      d.triggered.forEach(t=>{
-        toast(t.message,'info');
-        if(Notification.permission==='granted'){
-          new Notification('📢 到價提醒',{body:t.message,icon:'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y=".9em" font-size="90">🐂</text></svg>'});
-        }
-        // Remove triggered alert
-        priceAlerts=priceAlerts.filter(a=>!(a.code===t.code&&a.dir===t.direction&&a.price===t.target));
-      });
-      localStorage.setItem('priceAlerts',JSON.stringify(priceAlerts));
-      renderAlerts();
-    }
-  }catch(e){}
+    if(!d.ok){if(msg){msg.style.color='var(--red)';msg.textContent=d.msg||'設定失敗'}return}
+    $('a-code').value='';$('a-price').value='';
+    if(msg){msg.style.color='var(--green)';msg.textContent=`✓ ${d.name}(${code}) ${d.direction==='up'?'漲到 ≥':'跌到 ≤'} ${target}（現價 ${d.current}），到價推 LINE`}
+    toast('提醒已設定，到價自動推 LINE','success');
+    renderAlerts();
+  }catch(e){if(msg){msg.style.color='var(--red)';msg.textContent='設定失敗'}}
 }
-setInterval(checkPriceAlerts,15000);
+async function removeAlert(id){
+  try{await fetch('/api/alert_del',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})})}catch(e){}
+  renderAlerts();
+}
+async function renderAlerts(){
+  const el=$('a-list'); if(!el)return;
+  try{
+    const r=await fetch('/api/alerts_list'); const d=await r.json();
+    const alerts=(d&&d.alerts)||[];
+    if(!alerts.length){el.innerHTML='<div style="color:var(--dim);padding:20px;text-align:center">尚未設定任何提醒<br><span style="font-size:12px">設定後到價會自動推 LINE 給你（不用開 app）</span></div>';return}
+    el.innerHTML=alerts.map(a=>`<div class="alert-item">
+      <div><span style="font-weight:700">${a.name||a.code}</span> <span style="color:var(--dim);font-size:12px">${a.code} · ${a.direction==='up'?'漲到 ≥':'跌到 ≤'} <b style="color:${a.direction==='up'?'var(--red)':'var(--green)'}">${a.target}</b></span></div>
+      <button class="alert-del" onclick="removeAlert(${a.id})">✕</button>
+    </div>`).join('');
+  }catch(e){el.innerHTML='<div style="color:var(--red);padding:12px">載入提醒失敗</div>'}
+}
+
+let _movesTimer=null;
+async function loadMoves(){
+  const el=$('moves-list'); if(!el)return;
+  try{
+    const r=await fetch('/api/intraday_alerts?pct=5');
+    const d=await r.json();
+    const a=(d&&d.alerts)||[];
+    const st=$('moves-status');
+    if(st)st.innerHTML=(d.market_open?'🟢 開盤中':'⚪ 已收盤／非交易時段')+'　台北 '+(d.tw_time||'')+'　·　門檻 ±'+(d.pct||5)+'%　·　共 <b>'+a.length+'</b> 檔異動';
+    if(!a.length){
+      el.innerHTML='<div style="color:var(--dim);padding:24px;text-align:center">目前沒有明顯異動<br><span style="font-size:12px">±5% 以上急拉／急殺、漲跌停會出現在這裡，並自動推 LINE 給你</span></div>';
+    }else{
+      el.innerHTML=a.map(x=>{
+        const up=x.change_pct>=0, col=up?'var(--red)':'var(--green)';
+        const limit=(x.type==='漲停'||x.type==='跌停');
+        return `<div class="alert-item" style="cursor:pointer" onclick="openGooayeStock('${x.code}')" title="點看完整分析">
+          <div><span style="font-weight:700">${x.icon} ${x.name}</span> <span style="color:var(--dim);font-size:12px">${x.code}</span>
+            <span style="margin-left:6px;font-size:11px;padding:1px 7px;border-radius:5px;border:1px solid ${col};${limit?'background:'+col+';color:#000':'color:'+col}">${x.type}</span></div>
+          <div style="text-align:right"><div style="font-weight:700">${x.price}</div><div style="color:${col};font-size:12px">${up?'+':''}${x.change_pct}%</div></div>
+        </div>`;
+      }).join('');
+    }
+    if(_movesTimer)clearTimeout(_movesTimer);
+    if(d.market_open)_movesTimer=setTimeout(loadMoves,60000);   // refresh every 60s while open
+  }catch(e){el.innerHTML='<div style="color:var(--red);padding:12px">載入異動失敗</div>'}
+}
+function stopMoves(){ if(_movesTimer){clearTimeout(_movesTimer);_movesTimer=null;} }
 
 function refreshAll(){
   countdown=30;
