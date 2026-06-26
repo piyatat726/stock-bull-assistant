@@ -318,12 +318,19 @@ def fetch_stocks(code_market_pairs):
         s = parse_stock(item)
         if s and s['code']:
             results.append(s)
-    # Fallback to Yahoo Finance if TWSE returned nothing (cloud deploy outside Taiwan)
-    if not results and code_market_pairs:
-        for code, market in code_market_pairs:
-            s = fetch_stock_yahoo(code, market)
-            if s:
-                results.append(s)
+    # Per-code Yahoo backfill for any requested code MIS didn't return — covers a
+    # fully-empty batch (MIS blocked outside Taiwan) AND a single throttled or
+    # market-misclassified code that would otherwise be silently dropped from a
+    # multi-code batch (e.g. a TSE stock queried as otc). Common case: nothing
+    # missing → zero Yahoo calls → no penalty.
+    got = {r['code'] for r in results}
+    missing = [(c, m) for c, m in code_market_pairs if c not in got]
+    if missing:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(8, len(missing))) as pool:
+            for s in pool.map(lambda cm: fetch_stock_yahoo(cm[0], cm[1]), missing):
+                if s and s['code']:
+                    results.append(s)
     # Always apply Chinese name mapping (ensures cloud version shows Chinese)
     for r in results:
         cn = STOCK_NAMES.get(r['code']) or _name_cache.get(r['code'])
@@ -2468,15 +2475,36 @@ def _compute_top_buys():
 
 _topbuys_cache = {'t': 0, 'data': None}
 
+
+def _restamp_topbuys(picks):
+    """Refresh each pick's displayed price/change_pct from a live quote. The
+    selection/scoring is cached 120s (expensive), but freezing PRICES that long
+    makes the 綜合推薦 panel contradict /api/realtime (a stock can show green here
+    and red there). Re-stamping keeps prices ≤15s fresh like the rest of the app."""
+    if not picks:
+        return picks
+    pairs = list({(p['code'], _alert_mkt(p['code'])) for p in picks})
+    live = {}
+    for s in fetch_stocks(pairs):
+        if s and s.get('code') and s.get('price'):
+            live[s['code']] = s
+    for p in picks:
+        q = live.get(p['code'])
+        if q:
+            p['price'] = q['price']
+            p['change_pct'] = q['change_pct']
+    return picks
+
+
 @app.route('/api/top_buys')
 def top_buys():
     """今日綜合推薦：從最新資料(技術/新聞/動能/估值)綜合篩出可關注的買進候選。"""
     if _topbuys_cache['data'] is not None and time.time() - _topbuys_cache['t'] < 120:
-        return jsonify(_topbuys_cache['data'])
+        return jsonify(_restamp_topbuys(_topbuys_cache['data']))
     data = _compute_top_buys()
     _topbuys_cache['t'] = time.time()
     _topbuys_cache['data'] = data
-    return jsonify(data)
+    return jsonify(_restamp_topbuys(data))
 
 def _ai_complete(prompt, system='你是專業、客觀、謹慎的台股分析助理。'):
     """Call an LLM — Claude (ANTHROPIC_API_KEY) preferred, else ChatGPT
@@ -2747,9 +2775,23 @@ def check_intraday():
         return jsonify({'skipped': 'no dedup store (PNL_VAL_URL unset)'})
     alerts = _scan_intraday_alerts(pct)
     day = tw.strftime('%Y-%m-%d')
-    d = cached_get(url.rstrip('/') + '/api/intraday_seen?day=' + day, ttl=0, timeout=8) or {}
-    seen = set(d.get('seen', [])) if isinstance(d, dict) else set()
-    new = [a for a in alerts if f"{a['code']}:{a['type']}" not in seen]
+    # Atomically CLAIM today's-unseen keys on the Val side (INSERT OR IGNORE) and
+    # push ONLY what this call newly claimed. Race-safe (an overlapping cron retry
+    # claims 0 → pushes nothing) and never re-spams (a key already alerted today
+    # comes back empty). On ANY claim failure we push nothing — at-most-once: a
+    # missed 10-min alert beats duplicate LINE spam on a noise-sensitive channel.
+    claimed = set()
+    if alerts:
+        keys = [f"{a['code']}:{a['type']}" for a in alerts]
+        try:
+            r = requests.post(url.rstrip('/') + '/api/intraday_mark',
+                              json={'secret': os.environ.get('PNL_SECRET', ''), 'day': day, 'keys': keys},
+                              timeout=10)
+            if r.status_code == 200:
+                claimed = set((r.json() or {}).get('claimed', []))
+        except Exception:
+            claimed = set()
+    new = [a for a in alerts if f"{a['code']}:{a['type']}" in claimed]
     pushed = False
     if new:
         lines = [f'⚡ 盤中異動提醒　{tw.strftime("%H:%M")}']
@@ -2758,12 +2800,6 @@ def check_intraday():
             lines.append(f"{a['icon']} {a['name']}({a['code']}) {a['type']}　{a['price']}　{sign}{a['change_pct']}%")
         res = _line_push('\n'.join(lines), len(new))
         pushed = bool(res and res.get('pushed'))
-        try:
-            requests.post(url.rstrip('/') + '/api/intraday_mark',
-                          json={'secret': os.environ.get('PNL_SECRET', ''), 'day': day,
-                                'keys': [f"{a['code']}:{a['type']}" for a in new]}, timeout=8)
-        except Exception:
-            pass
     return jsonify({'scanned': len(_intraday_universe()), 'found': len(alerts),
                     'new': len(new), 'pushed': pushed, 'tw_time': tw.strftime('%H:%M')})
 
