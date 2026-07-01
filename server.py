@@ -2369,11 +2369,18 @@ def scan_and_push():
                   if s.get('total_weight', 0) >= 8][:5]   # for the 累計戰績 ledger
     sections = []
     if buys:
-        block = ['⭐ 今日綜合推薦（多訊號命中＝越強）']
+        block = ['⭐ 今日綜合推薦（附理由＋短線展望）']
         for b in buys:
-            srcs = '＋'.join(b.get('sources', []))
-            line = (f"・{b['name']}({b['code']})　{b.get('change_pct', 0):+.1f}%"
-                    + (f"　[{srcs}]" if srcs else ''))
+            line = f"{b.get('outlook_tag', '📈')} {b['name']}({b['code']})　{b.get('change_pct', 0):+.1f}%"
+            why = '、'.join(b.get('reasons', [])[:2])
+            if why:
+                line += f"\n　為什麼：{why}"
+            fc = f"　展望：{b.get('outlook', '短線偏多')}"
+            if b.get('win_prob'):
+                fc += f"，此類設定回測勝率約 {b['win_prob']}%"
+                if b.get('horizon_days'):
+                    fc += f"（約 {b['horizon_days']} 天）"
+            line += '\n' + fc
             if b.get('entry'):
                 line += f"\n　進場 {b['entry']}｜停損 {b['stop_loss']}｜目標 {b['target']}"
             block.append(line)
@@ -2388,8 +2395,14 @@ def scan_and_push():
         return jsonify({'pushed': False, 'reason': 'no picks today', 'count': 0})
 
     tw_hour = (datetime.datetime.utcnow().hour + 8) % 24
-    head = '台股開盤精選' if tw_hour < 12 else '台股盤後精選'
-    msg = f'📈 {head}（{today}）\n\n' + '\n\n'.join(sections) + '\n\n※ 僅供參考，不構成投資建議'
+    if tw_hour < 9:
+        head = '🌅 今日盤前展望'
+    elif tw_hour < 12:
+        head = '📈 台股開盤精選'
+    else:
+        head = '📊 台股盤後精選'
+    msg = (f'{head}（{today}）\n\n' + '\n\n'.join(sections)
+           + '\n\n※ 展望＝機率推估、非保證；回測為歷史紙上模擬。僅供參考，不構成投資建議')
     res = _line_push(msg, len(buys) + len(news[:4]))
     # Record technical entries to the 累計戰績 ledger AFTER the push, so the
     # bookkeeping can never delay or block the user-critical LINE message.
@@ -2471,7 +2484,55 @@ def _compute_top_buys():
         c['score'] = round(c['score'] + (c['n_sources'] - 1) * 4, 1)   # multi-signal bonus
         out.append(c)
     out.sort(key=lambda x: x['score'], reverse=True)
-    return out[:15]
+    return _add_outlook(out[:15])
+
+
+_baserates_cache = {'t': 0, 'd': None}
+
+
+def _forecast_baserates():
+    """Backtested win-rates (cached 6h) used as the HONEST base-rate probability
+    for the 短線展望. This is the win-rate of the setup CLASS (multi-signal vs
+    single), NOT a per-stock guarantee — no crystal ball."""
+    now = time.time()
+    if _baserates_cache['d'] is not None and now - _baserates_cache['t'] < 21600:
+        return _baserates_cache['d']
+    try:
+        bt = _backtest_signals(12, 5)
+        d = {
+            'multi': (bt.get('confirmed') or {}).get('win_rate') or bt.get('win_rate') or 0,
+            'single': (bt.get('base_only') or {}).get('win_rate') or bt.get('win_rate') or 0,
+            'horizon': bt.get('avg_hold_days') or 0,
+        }
+    except Exception:
+        d = {'multi': 0, 'single': 0, 'horizon': 0}
+    _baserates_cache['t'] = now
+    _baserates_cache['d'] = d
+    return d
+
+
+def _add_outlook(picks):
+    """Attach an honest 短線展望 (forward outlook) to each pick: a directional lean,
+    a backtested base-rate probability (of the setup class), a typical horizon, and
+    a plain-language note. Clearly a probability estimate, never a guarantee."""
+    rates = _forecast_baserates()
+    for p in picks:
+        multi = p.get('n_sources', 1) >= 2
+        cp = p.get('change_pct') or 0
+        if cp >= 6:
+            p['outlook'] = '短線偏多（追高留意）'
+            p['outlook_tag'] = '⚠️'
+            p['outlook_note'] = '今日已漲多，建議分批或等回檔再進'
+        else:
+            p['outlook'] = '短線偏多'
+            p['outlook_tag'] = '📈'
+            p['outlook_note'] = ('多訊號同時確認，強度較高' if multi else '單一訊號，強度普通')
+        prob = rates['multi'] if multi else rates['single']
+        p['win_prob'] = round(prob) if prob else None
+        p['win_prob_class'] = '多訊號確認' if multi else '單一訊號'
+        p['horizon_days'] = round(rates['horizon']) if rates['horizon'] else None
+    return picks
+
 
 _topbuys_cache = {'t': 0, 'data': None}
 
@@ -2556,7 +2617,8 @@ def ai_analysis():
               f'【目前數據】\n{summary or "（無提供）"}\n\n'
               f'【最新新聞標題】\n{news_txt}\n\n'
               '請依序給：\n1) 一句話總結現在狀況\n2) 利多 1-2 點、利空 1-2 點\n'
-              '3) 技術面與估值面的客觀觀察\n4) 若要進場，該注意的風險與停損紀律\n\n'
+              '3) 技術面與估值面的客觀觀察\n4) 若要進場，該注意的風險與停損紀律\n'
+              '5) 綜合傾向：偏多／中性／偏空，一句話說明理由（以機率角度陳述，強調非保證）\n\n'
               '務必客觀中立，結尾標明「以上為資料整理，不構成投資建議」，不要保證漲跌。')
     text = _ai_complete(prompt)
     if not text:

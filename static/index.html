@@ -2651,6 +2651,7 @@ async function loadTopBuys(){
       const badges=(x.sources||[]).map(s=>`<span class="tbb" style="color:${sc[s]||'var(--dim)'};border-color:${sc[s]||'var(--border)'}">${s}</span>`).join('');
       const reasons=(x.reasons||[]).map(rs=>`<div>· ${rs}</div>`).join('');
       const lv=x.entry?`<div class="tbl"><span>進場 <b>${x.entry}</b></span><span>停損 <b style="color:var(--green)">${x.stop_loss}</b></span><span>目標 <b style="color:var(--red)">${x.target}</b></span>${x.risk_reward?`<span>風報比 <b>1:${x.risk_reward}</b></span>`:''}</div>`:'';
+      const fc=x.win_prob?`<div class="tbfc">${x.outlook_tag||'📈'} <b>${x.outlook||'短線偏多'}</b> · 此類設定回測勝率約 <b style="color:var(--gold)">${x.win_prob}%</b>${x.horizon_days?`（約 ${x.horizon_days} 天）`:''}${x.outlook_note?`<div style="color:var(--dim);font-size:11px;margin-top:2px">${x.outlook_note}</div>`:''}</div>`:'';
       const stars='●'.repeat(Math.min(x.n_sources,3))+'○'.repeat(Math.max(0,3-x.n_sources));
       return `<div class="tbcard" onclick="openGooayeStock('${x.code}')" title="點看完整分析">
         <div class="tbhead"><span class="tbrank">${i+1}</span>
@@ -2659,7 +2660,7 @@ async function loadTopBuys(){
           <div style="text-align:right"><div style="font-size:15px;font-weight:700">${x.price}</div><div style="font-size:12px;color:${cc}">${chg>0?'+':''}${chg.toFixed(2)}%</div></div>
         </div>
         <div class="tbbw">${badges}</div>
-        <div class="tbrs">${reasons}</div>${lv}</div>`;
+        <div class="tbrs"><div style="color:var(--gold);font-weight:600;margin-bottom:2px">為什麼</div>${reasons}</div>${fc}${lv}</div>`;
     }).join('');
     el.innerHTML=`<style>
       #topbuys-list{display:flex;flex-direction:column;gap:10px}
@@ -2672,6 +2673,7 @@ async function loadTopBuys(){
       .tbrs{font-size:11px;color:var(--dim);line-height:1.6;margin-bottom:7px}
       .tbl{display:flex;flex-wrap:wrap;gap:12px;font-size:12px;color:var(--dim);background:var(--card2);border-radius:8px;padding:8px 10px}
       .tbl b{color:var(--text)}
+      .tbfc{font-size:12px;color:var(--text);background:rgba(255,176,32,.08);border:1px solid rgba(255,176,32,.25);border-radius:8px;padding:7px 10px;margin-bottom:7px;line-height:1.5}
     </style>
     <div style="font-size:11px;color:var(--dim);margin-bottom:10px">多訊號同時命中＝越強（●＝命中訊號數）· 點卡片看完整分析 · <b style="color:var(--red)">僅供參考，不構成投資建議</b></div>
     ${cards}`;
