@@ -2377,7 +2377,10 @@ def scan_and_push():
                 line += f"\n　為什麼：{why}"
             fc = f"　展望：{b.get('outlook', '短線偏多')}"
             if b.get('win_prob'):
-                fc += f"，此類設定回測勝率約 {b['win_prob']}%"
+                if b.get('prob_kind') == 'stock':
+                    fc += f"，這檔近12個月同類訊號 {b.get('win_prob_n')} 次、勝率約 {b['win_prob']}%"
+                else:
+                    fc += f"，此類設定回測勝率約 {b['win_prob']}%"
                 if b.get('horizon_days'):
                     fc += f"（約 {b['horizon_days']} 天）"
             line += '\n' + fc
@@ -2511,11 +2514,48 @@ def _forecast_baserates():
     return d
 
 
+_stockbt_cache = {}
+_STOCKBT_MIN_N = 8   # per-stock sample floor — below this the win% is noise, use class rate
+
+
+def _stock_bt_stats(code):
+    """Per-stock backtest stats (cached 6h): how the SAME technical setup performed
+    on THIS stock over the last 12 months. Returns {'n','win_rate','avg_hold'} or
+    None. Small samples are the caller's problem (check n >= _STOCKBT_MIN_N)."""
+    now = time.time()
+    hit = _stockbt_cache.get(code)
+    if hit and now - hit['t'] < 21600:
+        return hit['d']
+    d = None
+    try:
+        trades = _bt_run_stock(code, _alert_mkt(code), 12, 5)
+        if trades:
+            wins = sum(1 for t in trades if t['win'])
+            d = {'n': len(trades),
+                 'win_rate': round(wins / len(trades) * 100),
+                 'avg_hold': round(sum(t['hold'] for t in trades) / len(trades))}
+    except Exception:
+        d = None
+    _stockbt_cache[code] = {'t': now, 'd': d}
+    return d
+
+
 def _add_outlook(picks):
     """Attach an honest 短線展望 (forward outlook) to each pick: a directional lean,
-    a backtested base-rate probability (of the setup class), a typical horizon, and
-    a plain-language note. Clearly a probability estimate, never a guarantee."""
+    a backtested probability, a typical horizon, and a plain-language note.
+    Probability source, in honesty order: (1) THIS stock's own 12-month backtest of
+    the same setup when the sample is big enough (prob_kind='stock', shows 次數);
+    (2) otherwise the setup CLASS base-rate (prob_kind='class'). Always an estimate,
+    never a guarantee."""
     rates = _forecast_baserates()
+    # Warm the per-stock caches in parallel (cold ≈ one Yahoo history fetch each).
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+        codes = list({p['code'] for p in picks})
+        with ThreadPoolExecutor(max_workers=min(10, max(1, len(codes)))) as pool:
+            list(pool.map(_stock_bt_stats, codes))
+    except Exception:
+        pass
     for p in picks:
         multi = p.get('n_sources', 1) >= 2
         cp = p.get('change_pct') or 0
@@ -2527,10 +2567,26 @@ def _add_outlook(picks):
             p['outlook'] = '短線偏多'
             p['outlook_tag'] = '📈'
             p['outlook_note'] = ('多訊號同時確認，強度較高' if multi else '單一訊號，強度普通')
-        prob = rates['multi'] if multi else rates['single']
-        p['win_prob'] = round(prob) if prob else None
-        p['win_prob_class'] = '多訊號確認' if multi else '單一訊號'
-        p['horizon_days'] = round(rates['horizon']) if rates['horizon'] else None
+        st = _stock_bt_stats(p['code'])
+        if st and st['n'] >= _STOCKBT_MIN_N and st['win_rate'] is not None:
+            p['prob_kind'] = 'stock'
+            p['win_prob'] = st['win_rate']
+            p['win_prob_n'] = st['n']
+            p['win_prob_class'] = f"這檔近12個月同類訊號 {st['n']} 次"
+            p['horizon_days'] = st['avg_hold'] or (round(rates['horizon']) if rates['horizon'] else None)
+            # Honesty: if THIS stock historically responds poorly to this setup,
+            # the outlook wording must say so — not contradict the number.
+            if st['win_rate'] < 40:
+                p['outlook'] = '訊號偏多、但這檔歷史勝率偏低'
+                p['outlook_tag'] = '⚠️'
+                p['outlook_note'] = '這檔過去對同類訊號反應較差，謹慎看待或縮小部位'
+        else:
+            prob = rates['multi'] if multi else rates['single']
+            p['prob_kind'] = 'class'
+            p['win_prob'] = round(prob) if prob else None
+            p['win_prob_n'] = None
+            p['win_prob_class'] = '多訊號確認' if multi else '單一訊號'
+            p['horizon_days'] = round(rates['horizon']) if rates['horizon'] else None
     return picks
 
 
@@ -4122,75 +4178,75 @@ def _bt_agg(trades):
     }
 
 
-def _backtest_signals(months=12, min_weight=6, max_hold=20):
-    """Walk historical data, fire a price-only SUBSET of the live technical signals,
-    simulate entry→stop/target/time-exit, and aggregate performance. No
-    look-ahead: signals at day i use only data up to i; entry at close[i].
-    Each trade is tagged `confirmed` (多頭排列: close>MA20>MA60) — the
-    historically-reconstructable proxy for 綜合推薦's multi-signal confirmation —
-    so we can compare the confirmed cohort's win-rate against the raw technical
-    core."""
+def _bt_run_stock(code, market, months=12, min_weight=5, max_hold=20):
+    """Backtest ONE stock: fire the price-only technical signal subset over its
+    history, simulate entry→stop/target/time-exit, return the trade list. No
+    look-ahead (signals at day i use only data up to i; entry at close[i]).
+    Each trade tagged `confirmed` (多頭排列: close>MA20>MA60). Shared by the
+    universe backtest AND the per-pick 短線展望, so the rules can never drift."""
     rng = '2y' if months > 12 else '1y'
+    rows = _bt_history(code, market, rng)
+    if len(rows) < 70:
+        return []
+    rows = rows[-(months * 21 + 60):] if months * 21 + 60 < len(rows) else rows
+    closes = [r['c'] for r in rows]; highs = [r['h'] for r in rows]
+    lows = [r['l'] for r in rows]; vols = [r['v'] for r in rows]
+    rsi, k, d, hist = _bt_indicators(closes, highs, lows)
+    n = len(closes)
+    ma = lambda p, i: sum(closes[i - p + 1:i + 1]) / p if i >= p - 1 else None
+    trades = []
+    i = 60   # start at 60 so MA60 (多頭排列確認) is always computable — no cohort mislabel
+    while i < n - 1:
+        w = 0
+        if rsi[i] is not None and rsi[i] <= 30: w += 3
+        if k[i] is not None and d[i] is not None:
+            if k[i] < 25 and d[i] < 25: w += 3
+            if k[i - 1] is not None and k[i - 1] <= d[i - 1] and k[i] > d[i] and k[i] < 50: w += 4
+        if hist[i] is not None and hist[i - 1] is not None and hist[i - 1] < 0 and hist[i] >= 0: w += 4
+        m5, m10, m20 = ma(5, i), ma(10, i), ma(20, i)
+        if m5 and m10 and m20 and closes[i] > m5 > m10 > m20: w += 3
+        pm5, pm10 = ma(5, i - 1), ma(10, i - 1)
+        if pm5 and pm10 and m5 and m10 and pm5 <= pm10 and m5 > m10: w += 3
+        if i >= 20:
+            av20 = sum(vols[i - 19:i + 1]) / 20
+            if av20 and vols[i] > av20 * 2 and closes[i] > closes[i - 1]: w += 3
+        if w >= min_weight:
+            m60 = ma(60, i)
+            confirmed = bool(m20 and m60 and closes[i] > m20 > m60)
+            entry = closes[i]
+            trs = [max(highs[j] - lows[j], abs(highs[j] - closes[j - 1]), abs(lows[j] - closes[j - 1]))
+                   for j in range(max(1, i - 13), i + 1)]
+            atr = sum(trs) / len(trs) if trs else entry * 0.03
+            rl = min(lows[i - 2:i + 1])
+            stop = max(rl * 0.99, entry - 2 * atr)
+            if stop >= entry:
+                stop = entry - 2 * atr
+            target = entry + 2 * (entry - stop)
+            outcome = None
+            for j in range(i + 1, min(i + max_hold + 1, n)):
+                if lows[j] <= stop:
+                    outcome = (stop - entry) / entry * 100; exit_i = j; break
+                if highs[j] >= target:
+                    outcome = (target - entry) / entry * 100; exit_i = j; break
+            if outcome is None:
+                exit_i = min(i + max_hold, n - 1)
+                outcome = (closes[exit_i] - entry) / entry * 100
+            trades.append({'ret': outcome, 'hold': exit_i - i, 'win': outcome > 0,
+                           'confirmed': confirmed, 'code': code})
+            i = exit_i + 1  # no overlapping trades on same stock
+        else:
+            i += 1
+    return trades
+
+
+def _backtest_signals(months=12, min_weight=6, max_hold=20):
+    """Universe backtest over the popular list — aggregates _bt_run_stock trades
+    and compares the multi-signal-confirmed cohort against the raw technical core."""
     pairs = [(c, 'tse') for c in POPULAR_TSE[:30]] + [(c, 'otc') for c in POPULAR_OTC[:10]]
     from concurrent.futures import ThreadPoolExecutor
-
-    def run(pair):
-        code, market = pair
-        rows = _bt_history(code, market, rng)
-        if len(rows) < 70:
-            return []
-        rows = rows[-(months * 21 + 60):] if months * 21 + 60 < len(rows) else rows
-        closes = [r['c'] for r in rows]; highs = [r['h'] for r in rows]
-        lows = [r['l'] for r in rows]; vols = [r['v'] for r in rows]
-        rsi, k, d, hist = _bt_indicators(closes, highs, lows)
-        n = len(closes)
-        ma = lambda p, i: sum(closes[i - p + 1:i + 1]) / p if i >= p - 1 else None
-        trades = []
-        i = 60   # start at 60 so MA60 (多頭排列確認) is always computable — no cohort mislabel
-        while i < n - 1:
-            w = 0
-            if rsi[i] is not None and rsi[i] <= 30: w += 3
-            if k[i] is not None and d[i] is not None:
-                if k[i] < 25 and d[i] < 25: w += 3
-                if k[i - 1] is not None and k[i - 1] <= d[i - 1] and k[i] > d[i] and k[i] < 50: w += 4
-            if hist[i] is not None and hist[i - 1] is not None and hist[i - 1] < 0 and hist[i] >= 0: w += 4
-            m5, m10, m20 = ma(5, i), ma(10, i), ma(20, i)
-            if m5 and m10 and m20 and closes[i] > m5 > m10 > m20: w += 3
-            pm5, pm10 = ma(5, i - 1), ma(10, i - 1)
-            if pm5 and pm10 and m5 and m10 and pm5 <= pm10 and m5 > m10: w += 3
-            if i >= 20:
-                av20 = sum(vols[i - 19:i + 1]) / 20
-                if av20 and vols[i] > av20 * 2 and closes[i] > closes[i - 1]: w += 3
-            if w >= min_weight:
-                m60 = ma(60, i)
-                confirmed = bool(m20 and m60 and closes[i] > m20 > m60)
-                entry = closes[i]
-                trs = [max(highs[j] - lows[j], abs(highs[j] - closes[j - 1]), abs(lows[j] - closes[j - 1]))
-                       for j in range(max(1, i - 13), i + 1)]
-                atr = sum(trs) / len(trs) if trs else entry * 0.03
-                rl = min(lows[i - 2:i + 1])
-                stop = max(rl * 0.99, entry - 2 * atr)
-                if stop >= entry:
-                    stop = entry - 2 * atr
-                target = entry + 2 * (entry - stop)
-                outcome = None
-                for j in range(i + 1, min(i + max_hold + 1, n)):
-                    if lows[j] <= stop:
-                        outcome = (stop - entry) / entry * 100; exit_i = j; break
-                    if highs[j] >= target:
-                        outcome = (target - entry) / entry * 100; exit_i = j; break
-                if outcome is None:
-                    exit_i = min(i + max_hold, n - 1)
-                    outcome = (closes[exit_i] - entry) / entry * 100
-                trades.append({'ret': outcome, 'hold': exit_i - i, 'win': outcome > 0,
-                               'confirmed': confirmed, 'code': code})
-                i = exit_i + 1  # no overlapping trades on same stock
-            else:
-                i += 1
-        return trades
-
     with ThreadPoolExecutor(max_workers=10) as pool:
-        all_trades = [t for lst in pool.map(run, pairs) for t in lst]
+        all_trades = [t for lst in pool.map(
+            lambda p: _bt_run_stock(p[0], p[1], months, min_weight, max_hold), pairs) for t in lst]
 
     if not all_trades:
         return {'trades': 0, 'months': months, 'min_weight': min_weight,
