@@ -2557,7 +2557,7 @@ def scan_and_push():
 
     tw_hour = (datetime.datetime.utcnow().hour + 8) % 24
     if tw_hour < 9:
-        head, prio = '🌅 今日盤前展望', 'low'   # least essential of the 3 daily → yields quota first
+        head, prio = '🌅 今日盤前展望', 'normal'   # one of the user's 3 daily → send reliably
     elif tw_hour < 12:
         head, prio = '📈 台股開盤精選', 'normal'
     else:
