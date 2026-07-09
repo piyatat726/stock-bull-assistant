@@ -2058,13 +2058,56 @@ def value_alerts():
         threshold = 8.0
     return jsonify(_scan_value_alerts(threshold))
 
-def _line_push(msg, count):
+_quota_cache = {'t': 0, 'remaining': None}
+# How much free monthly quota a push of each priority insists on keeping in
+# reserve. critical (到價/健診 — user-set or holdings) always sends; the daily
+# 精選/週報 hold back below 15; the chatty 盤中異動/盤前展望 hold back below 40.
+_PRIORITY_FLOOR = {'critical': 0, 'normal': 15, 'low': 40}
+
+
+def _line_quota_remaining():
+    """Remaining LINE free-tier push quota this month (cached 30min). Returns an
+    int, a large number for an unlimited plan, or None if it can't be read."""
+    now = time.time()
+    if _quota_cache['remaining'] is not None and now - _quota_cache['t'] < 1800:
+        return _quota_cache['remaining']
+    token = os.environ.get('LINE_CHANNEL_TOKEN', '')
+    if not token:
+        return None
+    rem = None
+    try:
+        h = {'Authorization': f'Bearer {token}'}
+        q = requests.get('https://api.line.me/v2/bot/message/quota', headers=h, timeout=8).json()
+        if q.get('type') != 'limited':
+            rem = 10 ** 6
+        else:
+            c = requests.get('https://api.line.me/v2/bot/message/quota/consumption',
+                             headers=h, timeout=8).json()
+            rem = int(q.get('value', 0)) - int(c.get('totalUsage', 0))
+        _quota_cache['t'] = now
+        _quota_cache['remaining'] = rem
+    except Exception:
+        rem = None
+    return rem
+
+
+def _line_push(msg, count, priority='normal'):
     """Send a text message to LINE (broadcast, or push to LINE_TO). Returns a
-    JSON-able status dict. If no token is set, returns a preview instead."""
+    JSON-able status dict. If no token is set, returns a preview instead.
+    `priority` gates against the free 200/month quota: 'low' pushes are skipped
+    when <40 remain, 'normal' when <15, 'critical' always sends. On skip returns
+    {'pushed': False, 'reason': 'quota_low', 'remaining': n} — the caller must NOT
+    consume one-shot state (e.g. a 到價提醒) when pushed is False."""
     token = os.environ.get('LINE_CHANNEL_TOKEN', '')
     if not token:
         return {'pushed': False, 'reason': 'LINE_CHANNEL_TOKEN not set',
                 'count': count, 'preview': msg}
+    floor = _PRIORITY_FLOOR.get(priority, 15)
+    if floor > 0:
+        rem = _line_quota_remaining()
+        if rem is not None and rem < floor:
+            return {'pushed': False, 'reason': 'quota_low', 'remaining': rem,
+                    'count': count, 'preview': msg}
     try:
         to = os.environ.get('LINE_TO', '')
         if to:
@@ -2307,20 +2350,135 @@ def line_status():
         out['quota_exhausted'] = remain <= 0
     return jsonify(out)
 
+_NAME2CODE = {}
+
+
+def _name_to_code(text):
+    """Exact stock-name → code lookup (built lazily from STOCK_NAMES, ~11k)."""
+    if not _NAME2CODE:
+        for c, n in STOCK_NAMES.items():
+            if n:
+                _NAME2CODE.setdefault(n, c)
+    return _NAME2CODE.get(text)
+
+
+def _line_reply(reply_token, text):
+    """Reply to a LINE message — replies are FREE (don't count against the
+    200/month push quota). Best-effort; logs non-200 so expired-token failures
+    are visible instead of silent."""
+    token = os.environ.get('LINE_CHANNEL_TOKEN', '')
+    if not token or not reply_token:
+        return False
+    try:
+        r = requests.post('https://api.line.me/v2/bot/message/reply',
+                          headers={'Authorization': f'Bearer {token}',
+                                   'Content-Type': 'application/json'},
+                          json={'replyToken': reply_token,
+                                'messages': [{'type': 'text', 'text': text[:4900]}]},
+                          timeout=10)
+        if r.status_code != 200:
+            print(f'[line_reply] {r.status_code} {r.text[:160]}')
+        return r.status_code == 200
+    except Exception as e:
+        print(f'[line_reply] error {str(e)[:120]}')
+        return False
+
+
+def _quick_analysis(code, t0=None):
+    """Compact stock analysis for the LINE reply: live quote + 訊號 + per-stock
+    backtested 展望. Time-budgeted (t0): the quote is cheap and always included, but
+    the heavier entry-signal scan and per-stock backtest are SKIPPED once ~18s have
+    elapsed, so the reply always lands inside LINE's ~60s reply-token window even on
+    a cold start."""
+    if t0 is None:
+        t0 = time.time()
+    q = None
+    mk = _alert_mkt(code)
+    for m in (mk, 'otc' if mk == 'tse' else 'tse'):
+        got = fetch_stocks([(code, m)])
+        if got and got[0].get('price'):
+            q = got[0]
+            break
+    if not q:
+        return None
+    cp = q.get('change_pct') or 0
+    lines = [f"🐂 {q.get('name', code)}({code})　{q['price']}　{cp:+.2f}%"]
+    if time.time() - t0 > 18:   # budget spent — reply quote-only, stay in the token window
+        lines.append('（訊號＋展望較花時間，請開 app 看完整分析）')
+        lines.append('※ 僅供參考，不構成投資建議')
+        return '\n'.join(lines)
+    sig = None
+    try:
+        for s in _compute_entry_signals():
+            if s.get('code') == code:
+                sig = s
+                break
+    except Exception:
+        pass
+    if sig:
+        names = '、'.join(x.get('type', '') for x in sig.get('signals', [])[:3])
+        lines.append(f"訊號：{names}（強度 {sig.get('total_weight')}）")
+        if sig.get('entry'):
+            lines.append(f"進場 {sig['entry']}｜停損 {sig.get('stop_loss')}｜目標 {sig.get('target')}")
+    else:
+        lines.append('訊號：目前無明確技術進場訊號')
+    st = _stock_bt_stats(code)
+    if st and st['n'] >= _STOCKBT_MIN_N:
+        tone = '偏低，謹慎' if st['win_rate'] < 40 else '可留意'
+        lines.append(f"展望：這檔近12個月同類訊號 {st['n']} 次、勝率約 {st['win_rate']}%（{tone}）")
+    lines.append('※ 機率推估非保證，僅供參考。更多分析請開 app')
+    return '\n'.join(lines)
+
+
 @app.route('/api/line_webhook', methods=['POST', 'GET'])
 def line_webhook():
-    """LINE Messaging API webhook. Captures the sender's userId (one-time, so we
-    can switch from broadcast to instant direct push) and saves it to the
-    Val.town store, where it can be read and promoted to the LINE_TO env var."""
+    """LINE Messaging API webhook. (1) Captures the sender's userId (so pushes can
+    go direct instead of broadcast); (2) 雙向查股 — a text message that is a stock
+    code (e.g. 2330) or exact name (台積電) gets an instant analysis REPLY (free,
+    no quota). Optional signature check when LINE_CHANNEL_SECRET is set."""
     if request.method == 'GET':
         return jsonify({'ok': True, 'msg': 'LINE webhook ready'})
+    # Signature verification. LINE ALWAYS sends X-Line-Signature, so the reply/
+    # save-uid paths REQUIRE a verified signature — otherwise a forged POST could
+    # (a) hijack the push destination via save-uid or (b) amplify cost by triggering
+    # analysis. Without LINE_CHANNEL_SECRET set we can't verify, so we do nothing
+    # expensive and no state change (the 雙向查股 feature needs LINE_CHANNEL_SECRET).
+    ch_secret = os.environ.get('LINE_CHANNEL_SECRET', '')
+    if not ch_secret:
+        return jsonify({'ok': True, 'note': '需設 LINE_CHANNEL_SECRET 才會啟用回覆/uid 擷取'})
+    import hmac, hashlib, base64
+    try:
+        want = base64.b64encode(hmac.new(ch_secret.encode(), request.get_data(),
+                                         hashlib.sha256).digest()).decode()
+    except Exception:
+        return jsonify({'error': 'bad request'}), 400
+    got_sig = request.headers.get('X-Line-Signature', '')
+    if not hmac.compare_digest(want, got_sig):
+        return jsonify({'error': 'bad signature'}), 403
     payload = request.get_json(force=True, silent=True) or {}
-    uid = ''
+    uid, replied = '', False
+    t0 = time.time()
     for ev in payload.get('events', []):
         src = ev.get('source', {}) or {}
-        if src.get('userId'):
-            uid = src['userId']
-            break
+        u = src.get('userId', '')
+        if u and not uid and u.startswith('U') and len(u) == 33:   # valid LINE uid shape
+            uid = u
+        msg = ev.get('message', {}) or {}
+        text = (msg.get('text') or '').strip() if msg.get('type') == 'text' else ''
+        rt = ev.get('replyToken', '')
+        if not text or not rt:
+            continue
+        if replied:   # one heavy analysis per batch; ack extras cheaply (free reply)
+            _line_reply(rt, '一次查一檔喔，其他檔請再傳一次 🐂')
+            continue
+        up = text.upper()
+        code = up if re.fullmatch(r'\d{4,6}[A-Z]?', up) else _name_to_code(text)
+        if code:
+            ana = _quick_analysis(code, t0)
+            replied = _line_reply(rt, ana or f'查不到 {text} 的即時報價，確認代碼再試一次 🐂')
+        elif len(text) <= 12:
+            replied = _line_reply(rt, '傳股票代碼（如 2330）或名稱（如 台積電）給我，'
+                                      '馬上回你即時分析 🐂')
     if uid:
         val_url = os.environ.get('PNL_VAL_URL', '')
         if val_url:
@@ -2330,7 +2488,7 @@ def line_webhook():
                               timeout=6)
             except Exception:
                 pass
-    return jsonify({'ok': True, 'captured': bool(uid)})
+    return jsonify({'ok': True, 'captured': bool(uid), 'replied': replied})
 
 @app.route('/api/scan_and_push')
 def scan_and_push():
@@ -2399,19 +2557,52 @@ def scan_and_push():
 
     tw_hour = (datetime.datetime.utcnow().hour + 8) % 24
     if tw_hour < 9:
-        head = '🌅 今日盤前展望'
+        head, prio = '🌅 今日盤前展望', 'low'   # least essential of the 3 daily → yields quota first
     elif tw_hour < 12:
-        head = '📈 台股開盤精選'
+        head, prio = '📈 台股開盤精選', 'normal'
     else:
-        head = '📊 台股盤後精選'
+        head, prio = '📊 台股盤後精選', 'normal'
     msg = (f'{head}（{today}）\n\n' + '\n\n'.join(sections)
            + '\n\n※ 展望＝機率推估、非保證；回測為歷史紙上模擬。僅供參考，不構成投資建議')
-    res = _line_push(msg, len(buys) + len(news[:4]))
-    # Record technical entries to the 累計戰績 ledger AFTER the push, so the
-    # bookkeeping can never delay or block the user-critical LINE message.
-    if sig_strong:
-        _pnl_record(sig_strong)
+    res = _line_push(msg, len(buys) + len(news[:4]), priority=prio)
+    # Record entries to the 累計戰績 ledger AFTER the push — but only when the push
+    # actually DELIVERED (res.pushed). Gate on tw_hour >= 9 too: the 08:40 盤前展望
+    # run must not book at 試撮 (pre-open auction) prices, and a quota-skipped push
+    # must not book recommendations the user never received.
+    if tw_hour >= 9 and res.get('pushed'):
+        if sig_strong:
+            _pnl_record(sig_strong)
+        if buys:
+            _pnl_record_topbuys(buys)
     return jsonify(res)
+
+
+def _pnl_record_topbuys(picks):
+    """Book each 綜合推薦 pick into the Val ledger as a paper position tagged
+    source='topbuys', so the 週五成績單 can verify the recommendations against
+    what actually happened. Uses the technical entry/stop/target when present,
+    else the live price as cost basis. Val-side dedup keeps one lot per stock."""
+    url = os.environ.get('PNL_VAL_URL', '')
+    if not url or not picks:
+        return {'recorded': 0}
+    n = 0
+    for p in picks:
+        try:
+            entry = p.get('entry') or p.get('price')
+            if not entry:
+                continue
+            r = requests.post(url.rstrip('/') + '/api/record', json={
+                'secret': os.environ.get('PNL_SECRET', ''), 'action': 'entry',
+                'code': p['code'], 'name': p.get('name', p['code']),
+                'market': _alert_mkt(p['code']), 'entry': entry,
+                'stop': p.get('stop_loss'), 'target': p.get('target'),
+                'strategy': '＋'.join(p.get('sources', [])[:3]),
+                'source': 'topbuys'}, timeout=5)
+            if r.status_code == 200 and (r.json() or {}).get('ok'):
+                n += 1
+        except Exception:
+            pass
+    return {'recorded': n}
 
 def _compute_top_buys():
     """今日綜合推薦：fuse the FRESHEST signals — 技術進場訊號 + 利多新聞 + 科技動能
@@ -2772,13 +2963,19 @@ def check_alerts():
         for a, cur in hits:
             arrow = '漲到' if a['direction'] == 'up' else '跌到'
             lines.append(f"・{a['name']}({a['code']}) {arrow} {a['target']}　現價 {cur}")
-        _line_push('\n'.join(lines), len(hits))
-        for a, cur in hits:
-            try:
-                requests.post(url.rstrip('/') + '/api/alert_trigger',
-                              json={'secret': os.environ.get('PNL_SECRET', ''), 'id': a['id'], 'price': cur}, timeout=6)
-            except Exception:
-                pass
+        res = _line_push('\n'.join(lines), len(hits), priority='critical')
+        # Only CONSUME the one-shot alerts if the push actually delivered — else a
+        # transient failure/quota skip would silently delete a user's price alert.
+        # The */5min cron re-detects and retries on the next run.
+        if res.get('pushed'):
+            for a, cur in hits:
+                try:
+                    requests.post(url.rstrip('/') + '/api/alert_trigger',
+                                  json={'secret': os.environ.get('PNL_SECRET', ''), 'id': a['id'], 'price': cur}, timeout=6)
+                except Exception:
+                    pass
+        else:
+            return jsonify({'checked': len(alerts), 'triggered': 0, 'push_failed': True})
     return jsonify({'checked': len(alerts), 'triggered': len(hits)})
 
 
@@ -2883,14 +3080,19 @@ def check_intraday():
     if tw.weekday() >= 5 or hm < 9 * 60 or hm > 13 * 60 + 31:
         return jsonify({'skipped': 'market closed', 'tw_time': tw.strftime('%H:%M')})
     try:
-        pct = float(request.args.get('pct', '5'))
+        pct = float(request.args.get('pct', '6'))   # ±6% default — fewer, more meaningful
     except ValueError:
-        pct = 5.0
+        pct = 6.0
     url = os.environ.get('PNL_VAL_URL', '')
     if not url:
         # No dedup store → we'd re-push the same anomalies every run (spam).
         # Refuse to push without dedup; the UI endpoint still works.
         return jsonify({'skipped': 'no dedup store (PNL_VAL_URL unset)'})
+    # 盤中異動 is the chattiest push — check quota BEFORE claiming so a quota skip
+    # doesn't burn the day's dedup slot (claim-then-skip would never re-announce).
+    rem = _line_quota_remaining()
+    if rem is not None and rem < _PRIORITY_FLOOR['low']:
+        return jsonify({'skipped': 'quota_low', 'remaining': rem})
     alerts = _scan_intraday_alerts(pct)
     day = tw.strftime('%Y-%m-%d')
     # Atomically CLAIM today's-unseen keys on the Val side (INSERT OR IGNORE) and
@@ -2916,10 +3118,251 @@ def check_intraday():
         for a in new[:15]:
             sign = '+' if a['change_pct'] >= 0 else ''
             lines.append(f"{a['icon']} {a['name']}({a['code']}) {a['type']}　{a['price']}　{sign}{a['change_pct']}%")
-        res = _line_push('\n'.join(lines), len(new))
+        res = _line_push('\n'.join(lines), len(new), priority='low')
         pushed = bool(res and res.get('pushed'))
     return jsonify({'scanned': len(_intraday_universe()), 'found': len(alerts),
                     'new': len(new), 'pushed': pushed, 'tw_time': tw.strftime('%H:%M')})
+
+
+def _cron_guard():
+    """Shared CRON_SECRET check for push endpoints. Returns an error response to
+    return, or None when authorized."""
+    secret = os.environ.get('CRON_SECRET', '')
+    if secret and request.args.get('key', '') != secret and \
+            request.headers.get('Authorization', '') != f'Bearer {secret}':
+        return jsonify({'error': 'unauthorized'}), 401
+    return None
+
+
+# ── 持股同步 (portfolio sync) — server-side copy so crons can 健診 your holdings ──
+
+@app.route('/api/portfolio_sync', methods=['POST'])
+def portfolio_sync():
+    """Frontend mirrors its localStorage portfolio here → stored in the Val config.
+    Payload: {stocks:[{code,name,market}], holdings:{code:{cost,qty}}}."""
+    url = os.environ.get('PNL_VAL_URL', '')
+    if not url:
+        return jsonify({'ok': False, 'msg': '儲存未設定'})
+    b = request.get_json(force=True, silent=True) or {}
+    stocks = b.get('stocks') or []
+    if not isinstance(stocks, list) or len(stocks) > 100:
+        return jsonify({'ok': False, 'msg': '格式錯誤'})
+    data = {'stocks': [{'code': str(s.get('code', ''))[:8], 'name': str(s.get('name', ''))[:24],
+                        'market': ('otc' if s.get('market') == 'otc' else 'tse')}
+                       for s in stocks if s.get('code')],
+            'holdings': b.get('holdings') if isinstance(b.get('holdings'), dict) else {},
+            'unit': 'stock' if b.get('unit') == 'stock' else 'lot',
+            'updated': datetime.datetime.utcnow().isoformat()}
+    try:
+        r = requests.post(url.rstrip('/') + '/api/portfolio',
+                          json={'secret': os.environ.get('PNL_SECRET', ''), 'data': data}, timeout=8)
+        return jsonify({'ok': r.status_code == 200})
+    except Exception:
+        return jsonify({'ok': False, 'msg': '同步失敗'})
+
+
+@app.route('/api/portfolio_get')
+def portfolio_get():
+    """Read back the synced portfolio (also enables cross-device restore)."""
+    url = os.environ.get('PNL_VAL_URL', '')
+    if not url:
+        return jsonify({})
+    return jsonify(cached_get(url.rstrip('/') + '/api/portfolio', ttl=30, timeout=8) or {})
+
+
+@app.route('/api/check_portfolio')
+def check_portfolio():
+    """Cron (盤後): 健診 the synced holdings — 大跌 / 跌破月線(MA20)/季線(MA60) /
+    距成本重挫 — and LINE-push ONLY when something needs attention (quota-friendly:
+    quiet days push nothing)."""
+    err = _cron_guard()
+    if err:
+        return err
+    url = os.environ.get('PNL_VAL_URL', '')
+    if not url:
+        return jsonify({'pushed': False, 'reason': 'no store'})
+    pf = cached_get(url.rstrip('/') + '/api/portfolio', ttl=0, timeout=8) or {}
+    stocks = pf.get('stocks') or []
+    if not stocks:
+        return jsonify({'pushed': False, 'reason': 'no portfolio synced'})
+    holdings = pf.get('holdings') or {}
+    today_ymd = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).strftime('%Y%m%d')
+    # Freshness guard: only trust REAL trades that are dated today — rejects the
+    # prior session's frozen snapshot that MIS serves on TW holidays (which would
+    # re-push yesterday's warnings and burn quota). Yahoo fallback has date='' → keep.
+    quotes = {s['code']: s for s in fetch_stocks([(s['code'], s.get('market', 'tse')) for s in stocks])
+              if s and s.get('price') and s.get('traded')
+              and (not s.get('date') or str(s['date']) == today_ymd)}
+    if not quotes:
+        return jsonify({'pushed': False, 'reason': 'stale/holiday snapshot', 'checked': len(stocks)})
+    warn_lines, warn_sig, ok_count = [], [], 0
+    for s in stocks[:40]:
+        code = s['code']
+        q = quotes.get(code)
+        if not q:
+            continue
+        price, cp = q['price'], q.get('change_pct') or 0
+        warns = []
+        if cp <= -3:
+            warns.append(f'今日大跌 {cp:+.1f}%')
+        try:
+            rows = _bt_history(code, s.get('market', 'tse'), '1y')
+            closes = [r['c'] for r in rows]
+            if len(closes) >= 61:
+                # exclude today's (possibly partial) bar from the MA baseline
+                base = closes[:-1]
+                ma20 = sum(base[-20:]) / 20
+                ma60 = sum(base[-60:]) / 60
+                prev = base[-1]
+                if prev >= ma60 > price:
+                    warns.append(f'跌破季線 {round(ma60, 1)}')
+                elif prev >= ma20 > price:
+                    warns.append(f'跌破月線 {round(ma20, 1)}')
+        except Exception:
+            pass
+        h = holdings.get(code) or {}
+        try:
+            cost = float(str(h.get('cost') or 0).replace(',', ''))   # tolerate '1,020'
+        except (TypeError, ValueError):
+            cost = 0
+        if cost > 0:
+            pl = (price - cost) / cost * 100
+            if pl <= -10:
+                warns.append(f'距成本 {pl:+.1f}%，檢視停損')
+        if warns:
+            warn_lines.append(f"・{q.get('name', code)}({code}) {price}（{cp:+.1f}%）\n　⚠️ {'；'.join(warns)}")
+            for tag in ('大跌', '季線', '月線', '成本'):
+                if any(tag in w for w in warns):
+                    warn_sig.append(f'{code}:{tag}')
+        else:
+            ok_count += 1
+    if not warn_lines:
+        return jsonify({'pushed': False, 'reason': 'all clear', 'checked': len(stocks)})
+    # Dedup across days: if the SAME set of (code, warn-category) is still warning
+    # (e.g. a position stays >10% underwater), don't re-push the identical alert
+    # every day — only push when the warning set changes. Numbers are excluded from
+    # the signature so a drifting % doesn't re-trigger.
+    sig = '|'.join(sorted(warn_sig))
+    try:
+        prev = (cached_get(url.rstrip('/') + '/api/kv?k=pf_warnsig', ttl=0, timeout=8) or {}).get('v')
+    except Exception:
+        prev = None
+    if sig and sig == prev:
+        return jsonify({'pushed': False, 'reason': 'warnings unchanged', 'warnings': len(warn_lines)})
+    tw = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+    msg = (f'💊 持股健診（{tw.strftime("%m/%d")} 盤後）\n\n' + '\n'.join(warn_lines[:10])
+           + (f'\n\n其餘 {ok_count} 檔無警訊 ✅' if ok_count else '')
+           + '\n\n※ 警訊＝提醒檢視，非賣出指令。僅供參考')
+    res = _line_push(msg, len(warn_lines), priority='critical')
+    if res.get('pushed'):
+        try:
+            requests.post(url.rstrip('/') + '/api/kv',
+                          json={'secret': os.environ.get('PNL_SECRET', ''), 'k': 'pf_warnsig', 'v': sig}, timeout=6)
+        except Exception:
+            pass
+    return jsonify({'pushed': bool(res.get('pushed')), 'warnings': len(warn_lines),
+                    'checked': len(stocks), 'preview': res.get('preview')})
+
+
+# ── 週五成績單 + 週日週報 ──
+
+def _fmt_pct(v):
+    try:
+        return f'{float(v):+.1f}%'
+    except (TypeError, ValueError):
+        return '—'
+
+
+@app.route('/api/weekly_scorecard')
+def weekly_scorecard():
+    """Cron (週五盤後): the honest 成績單 — how did this week's recorded picks
+    actually do (closed at real exits; open marked to live), plus cumulative."""
+    err = _cron_guard()
+    if err:
+        return err
+    url = os.environ.get('PNL_VAL_URL', '')
+    if not url:
+        return jsonify({'pushed': False, 'reason': 'no store'})
+    st = cached_get(url.rstrip('/') + '/api/stats', ttl=0, timeout=20) or {}
+    tw = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+    week_ago = (tw - datetime.timedelta(days=7)).strftime('%Y-%m-%d')
+    rows = []
+    for p in (st.get('open_positions') or []):
+        if (p.get('opened_date') or '') >= week_ago:
+            rows.append((p.get('name', p.get('code')), p.get('code'), p.get('last_pct'), '持有中'))
+    reason_zh = {'target': '🎯停利', 'stop': '🛑停損', 'time': '⏱到期', 'manual': '✋手動'}
+    for p in (st.get('recent_closed') or []):
+        if (p.get('opened_date') or '') >= week_ago:
+            rows.append((p.get('name', p.get('code')), p.get('code'), p.get('pnl_pct'),
+                         reason_zh.get(p.get('reason'), '已平倉')))
+    if not rows:
+        return jsonify({'pushed': False, 'reason': 'no entries this week'})
+    vals = [r for r in rows if isinstance(r[2], (int, float))]
+    wins = sum(1 for r in vals if r[2] > 0)
+    avg = sum(r[2] for r in vals) / len(vals) if vals else 0
+    rows.sort(key=lambda r: (r[2] if isinstance(r[2], (int, float)) else 0), reverse=True)
+    lines = [f'📇 本週推薦成績單（{(tw - datetime.timedelta(days=6)).strftime("%m/%d")}–{tw.strftime("%m/%d")}）',
+             '',
+             f'本週進場 {len(rows)} 檔：{wins} 勝 {len(vals) - wins} 敗（持有中以現價計）',
+             f'平均報酬 {_fmt_pct(avg)}', '']
+    for name, code, pct, status in rows[:8]:
+        lines.append(f'・{name}({code})　{_fmt_pct(pct)}　{status}')
+    if len(rows) > 8:
+        lines.append(f'…共 {len(rows)} 檔')
+    lines += ['', f"累計戰績：勝率 {st.get('win_rate', 0)}%（{st.get('wins', 0)}勝{st.get('losses', 0)}敗）"
+                  f"｜總報酬 {_fmt_pct(st.get('total_pnl_pct'))}",
+              f'👉 完整戰績：{url}',
+              '', '※ 紙上模擬、不含手續費滑價。僅供參考']
+    res = _line_push('\n'.join(lines), len(rows))
+    return jsonify({'pushed': bool(res.get('pushed')), 'entries': len(rows),
+                    'preview': res.get('preview')})
+
+
+@app.route('/api/weekly_review')
+def weekly_review():
+    """Cron (週日晚): 週報 — the week's TAIEX recap + cumulative track record +
+    next week's watchlist (with reasons + outlook), so Monday starts with a map."""
+    err = _cron_guard()
+    if err:
+        return err
+    tw = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+    lines = [f'🗞 小牛週報（{tw.strftime("%m/%d")}）', '']
+    try:
+        d = cached_get('https://query1.finance.yahoo.com/v8/finance/chart/%5ETWII?interval=1d&range=1mo',
+                       ttl=3600, timeout=10)
+        closes = [c for c in d['chart']['result'][0]['indicators']['quote'][0]['close'] if c]
+        if len(closes) >= 6:
+            wk = (closes[-1] - closes[-6]) / closes[-6] * 100
+            lines.append(f'📈 大盤近一週 {wk:+.1f}%，收 {round(closes[-1])} 點')
+    except Exception:
+        pass
+    url = os.environ.get('PNL_VAL_URL', '')
+    if url:
+        st = cached_get(url.rstrip('/') + '/api/stats', ttl=0, timeout=20) or {}
+        if st.get('closed_count'):
+            lines.append(f"📊 累計戰績：勝率 {st.get('win_rate', 0)}%（{st.get('closed_count')} 筆）"
+                         f"｜總報酬 {_fmt_pct(st.get('total_pnl_pct'))}"
+                         f"｜持有中 {st.get('open_count', 0)} 檔 {_fmt_pct(st.get('open_unreal_pct'))}")
+    try:
+        buys = _compute_top_buys()[:5]
+    except Exception:
+        buys = []
+    if buys:
+        lines += ['', '🔭 下週觀察名單（附理由＋展望）']
+        for b in buys:
+            why = '、'.join(b.get('reasons', [])[:2])
+            ln = f"{b.get('outlook_tag', '📈')} {b['name']}({b['code']})"
+            if why:
+                ln += f'\n　{why}'
+            if b.get('win_prob'):
+                src = (f"這檔同類訊號 {b.get('win_prob_n')} 次勝率" if b.get('prob_kind') == 'stock'
+                       else '同類設定回測勝率')
+                ln += f"\n　展望：{b.get('outlook', '短線偏多')}，{src}約 {b['win_prob']}%"
+            lines.append(ln)
+    lines += ['', '※ 展望＝機率推估、非保證；戰績為紙上模擬。僅供參考']
+    res = _line_push('\n'.join(lines), len(buys))
+    return jsonify({'pushed': bool(res.get('pushed')), 'watchlist': len(buys),
+                    'preview': res.get('preview')})
 
 
 @app.route('/api/recommend')

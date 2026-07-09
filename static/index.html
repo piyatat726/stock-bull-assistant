@@ -1074,12 +1074,42 @@ function updateUnitUI(){
 }
 function getPStocks(){
   let ps=JSON.parse(localStorage.getItem('portfolioStocks')||'null');
-  if(!ps){ps=WL.map(w=>({code:w.code,name:w.name,market:w.market||'tse'}));setPStocks(ps)}
+  // Return the watchlist default WITHOUT persisting/syncing it — auto-syncing the
+  // default would overwrite a real portfolio saved from another device (the cloud
+  // copy is restored by _pfRestore on load). Only explicit edits (add/remove/cost)
+  // call setPStocks and therefore sync.
+  if(!ps)return WL.map(w=>({code:w.code,name:w.name,market:w.market||'tse'}));
   return ps;
 }
-function setPStocks(d){localStorage.setItem('portfolioStocks',JSON.stringify(d))}
+function setPStocks(d){localStorage.setItem('portfolioStocks',JSON.stringify(d));syncPortfolio()}
+let _pfSyncT=null;
+function syncPortfolio(){ // mirror holdings to the server (debounced) → 持股健診 LINE 推播用
+  if(_pfSyncT)clearTimeout(_pfSyncT);
+  _pfSyncT=setTimeout(()=>{
+    try{
+      const stocks=JSON.parse(localStorage.getItem('portfolioStocks')||'[]');
+      if(!stocks.length)return;   // never overwrite the cloud copy with an empty set
+      const holdings=JSON.parse(localStorage.getItem('portfolio')||'{}');
+      const unit=localStorage.getItem('pUnit')||'lot';
+      fetch('/api/portfolio_sync',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({stocks,holdings,unit})}).catch(()=>{});
+    }catch(e){}
+  },1500);
+}
+const _pfRestore=(async function restorePortfolio(){ // cross-device restore when this browser has none
+  if(localStorage.getItem('portfolioStocks'))return;
+  try{
+    const d=await (await fetch('/api/portfolio_get')).json();
+    if(d&&Array.isArray(d.stocks)&&d.stocks.length){
+      localStorage.setItem('portfolioStocks',JSON.stringify(d.stocks));
+      if(d.holdings)localStorage.setItem('portfolio',JSON.stringify(d.holdings));
+      if(d.unit)localStorage.setItem('pUnit',d.unit);   // keep 股/張 consistent across devices
+    }
+  }catch(e){}
+})();
 async function addPStock(){
   const code=$('p-add-input').value.trim();if(!code)return;
+  try{await _pfRestore}catch(e){}   // ensure cloud copy is loaded before we edit+sync
   const ps=getPStocks();
   if(ps.some(s=>s.code===code)){toast('已在持股中','error');return}
   try{
@@ -1097,10 +1127,11 @@ function rmPStock(code){
   toast('已從持股移除','info');loadPortfolio();
 }
 function getP(){return JSON.parse(localStorage.getItem('portfolio')||'{}')}
-function setP(d){localStorage.setItem('portfolio',JSON.stringify(d))}
+function setP(d){localStorage.setItem('portfolio',JSON.stringify(d));syncPortfolio()}
 let pfData=[];  // cached analysis results so cost/qty edits re-render instantly
 async function loadPortfolio(){
   updateUnitUI();
+  try{await _pfRestore}catch(e){}  // don't let the WL-default fallback overwrite a cloud copy mid-restore
   const ps=getPStocks();
   if(!ps.length){
     $('pf-summary').innerHTML='';$('pf-hint').innerHTML='';
