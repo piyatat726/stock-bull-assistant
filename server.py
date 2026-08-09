@@ -251,6 +251,36 @@ def parse_stock(item):
     except (ValueError, TypeError):
         return None
 
+def _yahoo_prev_close(result):
+    """TRUE previous-session close from a Yahoo v8 multi-day chart result.
+
+    🔴 Do NOT use meta.chartPreviousClose on range>1d — it is the close at the
+    WINDOW START (≈5 sessions back on range=5d), which inflated change_pct into
+    impossible values (+20% on a ±10%-limited TW stock, seen live). Instead take
+    the last non-null daily close dated BEFORE the latest trade's (TW) date."""
+    try:
+        meta = result.get('meta', {})
+        ts = result.get('timestamp', []) or []
+        closes = result.get('indicators', {}).get('quote', [{}])[0].get('close', []) or []
+        valid = [(t, c) for t, c in zip(ts, closes) if c is not None and t is not None]
+        mt = meta.get('regularMarketTime')
+        if mt and valid:
+            mt_day = (datetime.datetime.utcfromtimestamp(mt) + datetime.timedelta(hours=8)).date()
+            before = [c for t, c in valid
+                      if (datetime.datetime.utcfromtimestamp(t) + datetime.timedelta(hours=8)).date() < mt_day]
+            if before:
+                return float(before[-1])
+        if len(valid) >= 2:
+            return float(valid[-2][1])
+    except Exception:
+        pass
+    p = result.get('meta', {}).get('chartPreviousClose') or result.get('meta', {}).get('previousClose')
+    try:
+        return float(p) if p else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _fetch_yahoo_single(code, suffix, market):
     """Fetch a single stock from Yahoo Finance with given suffix"""
     sym = f'{code}{suffix}'
@@ -262,12 +292,18 @@ def _fetch_yahoo_single(code, suffix, market):
     result = result[0]
     meta = result.get('meta', {})
     price = meta.get('regularMarketPrice')
-    prev = meta.get('chartPreviousClose') or meta.get('previousClose')
     if not price:
         return None
-    price, prev = float(price), float(prev) if prev else float(price)
+    price = float(price)
+    prev = _yahoo_prev_close(result) or price
     change = round(price - prev, 2)
     change_pct = round((change / prev * 100), 2) if prev else 0
+    # TW equities are hard-capped at ±10%/day. Beyond ~±11% the Yahoo instrument is
+    # internally broken (seen live: 5904.TWO meta price 720 vs close series 72 — a
+    # 10× scale mismatch on a suspended symbol → fake +900%). No quote beats a fake
+    # quote: reject the whole row so scans simply drop the code.
+    if abs(change_pct) > 11:
+        return None
     indicators = result.get('indicators', {}).get('quote', [{}])[0]
     volumes = indicators.get('volume', [])
     opens = indicators.get('open', [])
@@ -280,6 +316,14 @@ def _fetch_yahoo_single(code, suffix, market):
     name = STOCK_NAMES.get(code) or _name_cache.get(code) or meta.get('shortName', meta.get('symbol', code))
     if name: name = name.replace('.TW', '').replace('.TWO', '').strip()
     actual_market = 'otc' if suffix == '.TWO' else 'tse'
+    mt = meta.get('regularMarketTime')
+    trade_date = ''
+    if mt:
+        try:
+            trade_date = (datetime.datetime.utcfromtimestamp(mt)
+                          + datetime.timedelta(hours=8)).strftime('%Y%m%d')
+        except Exception:
+            trade_date = ''
     return {
         'code': code, 'name': name,
         'price': price, 'yesterday': prev,
@@ -287,7 +331,8 @@ def _fetch_yahoo_single(code, suffix, market):
         'open': str(round(op, 2)), 'high': str(round(hi, 2)), 'low': str(round(lo, 2)),
         'volume': str(int(vol / 1000)) if vol else '-',
         'time': '', 'market': actual_market,
-        'date': '', 'traded': True,         # Yahoo regularMarketPrice is a real last trade
+        'date': trade_date,                 # real trade date → freshness guards work on Yahoo path too
+        'traded': True,                     # Yahoo regularMarketPrice is a real last trade
         'limit_up': '-', 'limit_down': '-',
         'best_bid': '-', 'best_ask': '-',
     }
@@ -318,13 +363,27 @@ def fetch_stocks(code_market_pairs):
         s = parse_stock(item)
         if s and s['code']:
             results.append(s)
-    # Per-code Yahoo backfill for any requested code MIS didn't return — covers a
-    # fully-empty batch (MIS blocked outside Taiwan) AND a single throttled or
-    # market-misclassified code that would otherwise be silently dropped from a
-    # multi-code batch (e.g. a TSE stock queried as otc). Common case: nothing
-    # missing → zero Yahoo calls → no penalty.
+    # Backfill any requested code MIS didn't return. STEP 1: retry the missing
+    # codes on MIS itself with BOTH boards in one mixed query — MIS only answers
+    # on the code's REAL board, so this rescues market-misclassified codes (e.g. a
+    # TSE stock guessed as otc) with a proper same-day quote. This matters: the
+    # Yahoo path once computed change_pct against a ~5-session-old baseline (now
+    # fixed) and still lacks bid/ask/limit fields, so MIS is always preferable.
     got = {r['code'] for r in results}
     missing = [(c, m) for c, m in code_market_pairs if c not in got]
+    if missing:
+        try:
+            ex2 = '|'.join(f'{m}_{c}.tw|{"otc" if m == "tse" else "tse"}_{c}.tw' for c, m in missing)
+            d2 = cached_get(f'{API_BASE}?ex_ch={ex2}', timeout=5)
+            for item in d2.get('msgArray', []):
+                s = parse_stock(item)
+                if s and s['code'] and s['code'] not in got:
+                    got.add(s['code'])
+                    results.append(s)
+        except Exception:
+            pass
+        missing = [(c, m) for c, m in missing if c not in got]
+    # STEP 2: Yahoo as the last resort (MIS truly unreachable/blocked).
     if missing:
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=min(8, len(missing))) as pool:
@@ -417,9 +476,10 @@ def market_summary():
             try:
                 url = f'https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=5d'
                 d = cached_get(url, ttl=30)
-                meta = d.get('chart', {}).get('result', [{}])[0].get('meta', {})
+                res0 = d.get('chart', {}).get('result', [{}])[0]
+                meta = res0.get('meta', {})
                 price = meta.get('regularMarketPrice')
-                prev = meta.get('chartPreviousClose') or meta.get('previousClose')
+                prev = _yahoo_prev_close(res0)   # NOT chartPreviousClose (≈5 sessions old)
                 if price and prev:
                     price, prev = float(price), float(prev)
                     chg = round(price - prev, 2)
@@ -925,9 +985,10 @@ def global_market():
         try:
             url = f'https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=5d'
             data = cached_get(url, ttl=60)
-            meta = data.get('chart', {}).get('result', [{}])[0].get('meta', {})
+            res0 = data.get('chart', {}).get('result', [{}])[0]
+            meta = res0.get('meta', {})
             price = meta.get('regularMarketPrice')
-            prev = meta.get('chartPreviousClose') or meta.get('previousClose')
+            prev = _yahoo_prev_close(res0)   # NOT chartPreviousClose (≈5 sessions old)
             if price and prev:
                 price, prev = float(price), float(prev)
                 dp = 4 if key == 'usd_twd' else 2
@@ -1744,6 +1805,10 @@ def _dividend_quality(code, market, price=None, eps_annual=None, exch_yield=None
     while by_year.get(y, 0) > 0:
         consec += 1
         y -= 1
+    # Left-censored? The loop ran off the fetched 10y window rather than finding a
+    # true gap year — the real streak is AT LEAST consec (e.g. TSMC pays far longer
+    # than the window shows). Callers should render 「≥N 年」 when capped.
+    consec_capped = bool(by_year) and y < min(by_year)
     years_paid = len([y for y, a in by_year.items() if a > 0])
     # Trend: avg of last 3 completed years vs the 3 before that
     completed = sorted([yr for yr in by_year if yr < cur])
@@ -1822,7 +1887,7 @@ def _dividend_quality(code, market, price=None, eps_annual=None, exch_yield=None
         notes.append('近年股利縮水，留意獲利變化')
 
     return {
-        'consecutive_years': consec, 'years_paid': years_paid,
+        'consecutive_years': consec, 'consec_capped': consec_capped, 'years_paid': years_paid,
         'ttm_dividend': ttm, 'payout_ratio': payout, 'yield': yld,
         'trend': trend, 'score': score,
         'verdict': verdict, 'verdict_icon': vicon, 'verdict_desc': vdesc,
@@ -2060,8 +2125,11 @@ def value_alerts():
 
 _quota_cache = {'t': 0, 'remaining': None}
 # How much free monthly quota a push of each priority insists on keeping in
-# reserve. critical (到價/健診 — user-set or holdings) always sends; the daily
-# 精選/週報 hold back below 15; the chatty 盤中異動/盤前展望 hold back below 40.
+# reserve. critical (到價/健診 — user-set or holdings) always sends; 'normal'
+# covers ALL THREE daily pushes (盤前展望/開盤/盤後) + 成績單/週報, holding back
+# below 15. 'low' (floor 40) is currently UNUSED — its only caller was the 盤中
+# 異動 cron, deleted 2026-07-09 per user request (一天三則就好); kept for a
+# possible future re-enable of /api/check_intraday.
 _PRIORITY_FLOOR = {'critical': 0, 'normal': 15, 'low': 40}
 
 
@@ -2105,7 +2173,13 @@ def _line_push(msg, count, priority='normal'):
     floor = _PRIORITY_FLOOR.get(priority, 15)
     if floor > 0:
         rem = _line_quota_remaining()
-        if rem is not None and rem < floor:
+        if rem is None:
+            # Quota unknown (API error/timeout) → fail CLOSED for non-critical:
+            # don't risk spending quota reserved for 到價/健診. Critical (floor 0)
+            # never reaches here and always sends.
+            return {'pushed': False, 'reason': 'quota_unknown',
+                    'count': count, 'preview': msg}
+        if rem < floor:
             return {'pushed': False, 'reason': 'quota_low', 'remaining': rem,
                     'count': count, 'preview': msg}
     try:
@@ -2119,6 +2193,11 @@ def _line_push(msg, count, priority='normal'):
         r = requests.post(url, headers={'Authorization': f'Bearer {token}',
                                         'Content-Type': 'application/json'},
                           json=payload, timeout=10)
+        if r.status_code == 200 and _quota_cache['remaining'] is not None:
+            # Optimistically decrement the 30-min-cached remaining count so a burst
+            # of pushes inside one TTL window can't all read the same stale number
+            # and blow through the priority floors.
+            _quota_cache['remaining'] = max(0, _quota_cache['remaining'] - 1)
         return {'pushed': r.status_code == 200, 'http': r.status_code,
                 'count': count, 'resp': r.text[:200]}
     except Exception as e:
@@ -2565,11 +2644,13 @@ def scan_and_push():
     msg = (f'{head}（{today}）\n\n' + '\n\n'.join(sections)
            + '\n\n※ 展望＝機率推估、非保證；回測為歷史紙上模擬。僅供參考，不構成投資建議')
     res = _line_push(msg, len(buys) + len(news[:4]), priority=prio)
-    # Record entries to the 累計戰績 ledger AFTER the push — but only when the push
-    # actually DELIVERED (res.pushed). Gate on tw_hour >= 9 too: the 08:40 盤前展望
-    # run must not book at 試撮 (pre-open auction) prices, and a quota-skipped push
-    # must not book recommendations the user never received.
-    if tw_hour >= 9 and res.get('pushed'):
+    # Record entries to the 累計戰績 ledger AFTER the push. Gate on tw_hour >= 9
+    # (the 08:40 盤前展望 run must not book at 試撮 auction prices). Record when the
+    # push DELIVERED — or when it was skipped purely for LINE-quota reasons: the
+    # recommendations still exist and are visible in the app, and gating the ledger
+    # on quota starved the 成績單 for weeks when the monthly quota ran out.
+    recorded_ok = res.get('pushed') or res.get('reason') in ('quota_low', 'quota_unknown')
+    if tw_hour >= 9 and recorded_ok:
         if sig_strong:
             _pnl_record(sig_strong)
         if buys:
@@ -2801,6 +2882,13 @@ def _restamp_topbuys(picks):
         if q:
             p['price'] = q['price']
             p['change_pct'] = q['change_pct']
+    # If live data EXISTS but a specific pick has none (both MIS boards empty and
+    # Yahoo rejected/broken — e.g. a suspended symbol like 5904), drop that pick:
+    # never recommend a stock whose current price can't be confirmed. When live is
+    # entirely empty (systemic quote outage) keep everything rather than blank the
+    # page with compute-time data.
+    if live:
+        picks = [p for p in picks if p['code'] in live]
     return picks
 
 
@@ -3147,11 +3235,18 @@ def portfolio_sync():
     stocks = b.get('stocks') or []
     if not isinstance(stocks, list) or len(stocks) > 100:
         return jsonify({'ok': False, 'msg': '格式錯誤'})
-    data = {'stocks': [{'code': str(s.get('code', ''))[:8], 'name': str(s.get('name', ''))[:24],
-                        'market': ('otc' if s.get('market') == 'otc' else 'tse')}
-                       for s in stocks if s.get('code')],
-            'holdings': b.get('holdings') if isinstance(b.get('holdings'), dict) else {},
-            'unit': 'stock' if b.get('unit') == 'stock' else 'lot',
+    clean_stocks = [{'code': str(s.get('code', ''))[:8], 'name': str(s.get('name', ''))[:24],
+                     'market': ('otc' if s.get('market') == 'otc' else 'tse')}
+                    for s in stocks if s.get('code')]
+    codes = {s['code'] for s in clean_stocks}
+    raw_h = b.get('holdings') if isinstance(b.get('holdings'), dict) else {}
+    holdings = {}
+    for k, v in raw_h.items():
+        if str(k) in codes and isinstance(v, dict):   # only holdings for synced codes, coerced small
+            holdings[str(k)] = {'cost': str(v.get('cost', ''))[:16], 'qty': str(v.get('qty', ''))[:16]}
+    data = {'stocks': clean_stocks,
+            'holdings': holdings,
+            'unit': 'lot' if b.get('unit') == 'lot' else 'stock',   # default matches the UI ('stock')
             'updated': datetime.datetime.utcnow().isoformat()}
     try:
         r = requests.post(url.rstrip('/') + '/api/portfolio',
@@ -3163,11 +3258,20 @@ def portfolio_sync():
 
 @app.route('/api/portfolio_get')
 def portfolio_get():
-    """Read back the synced portfolio (also enables cross-device restore)."""
+    """Read back the synced portfolio (also enables cross-device restore).
+    Distinguishes 'cloud store unreachable' (502) from 'genuinely empty' ({}) —
+    the frontend must NOT treat an outage as an empty portfolio, or a subsequent
+    edit would overwrite the real cloud copy with the local default."""
     url = os.environ.get('PNL_VAL_URL', '')
     if not url:
         return jsonify({})
-    return jsonify(cached_get(url.rstrip('/') + '/api/portfolio', ttl=30, timeout=8) or {})
+    try:
+        r = requests.get(url.rstrip('/') + '/api/portfolio', timeout=8)
+        if r.status_code == 200:
+            return jsonify(r.json() or {})
+    except Exception:
+        pass
+    return jsonify({'error': 'store_unreachable'}), 502
 
 
 @app.route('/api/check_portfolio')
@@ -3207,13 +3311,17 @@ def check_portfolio():
             warns.append(f'今日大跌 {cp:+.1f}%')
         try:
             rows = _bt_history(code, s.get('market', 'tse'), '1y')
+            # Drop the last bar ONLY if it is truly today's (possibly partial) bar.
+            # The 12h-cached history may have been fetched pre-market, where the
+            # last bar is YESTERDAY's final close — blindly dropping it would shift
+            # the MA baseline a day back and mis-fire/suppress 跌破 warnings.
+            if rows and rows[-1].get('d') == today_ymd:
+                rows = rows[:-1]
             closes = [r['c'] for r in rows]
-            if len(closes) >= 61:
-                # exclude today's (possibly partial) bar from the MA baseline
-                base = closes[:-1]
-                ma20 = sum(base[-20:]) / 20
-                ma60 = sum(base[-60:]) / 60
-                prev = base[-1]
+            if len(closes) >= 60:
+                ma20 = sum(closes[-20:]) / 20
+                ma60 = sum(closes[-60:]) / 60
+                prev = closes[-1]
                 if prev >= ma60 > price:
                     warns.append(f'跌破季線 {round(ma60, 1)}')
                 elif prev >= ma20 > price:
@@ -4224,9 +4332,9 @@ def daily_summary():
         try:
             url = f'https://query1.finance.yahoo.com/v8/finance/chart/%5ETWII?interval=1d&range=5d'
             d = cached_get(url, ttl=60)
-            meta = d.get('chart', {}).get('result', [{}])[0].get('meta', {})
-            price = float(meta.get('regularMarketPrice', 0))
-            prev = float(meta.get('chartPreviousClose', 0) or meta.get('previousClose', 0))
+            res0 = d.get('chart', {}).get('result', [{}])[0]
+            price = float(res0.get('meta', {}).get('regularMarketPrice', 0))
+            prev = float(_yahoo_prev_close(res0) or 0)   # NOT chartPreviousClose (≈5 sessions old)
             if price and prev:
                 chg = round(price - prev, 2)
                 pct = round(chg / prev * 100, 2)
@@ -4553,10 +4661,16 @@ def _bt_history(code, market, rng='1y'):
                 c = q.get('close', [])[i] if i < len(q.get('close', [])) else None
                 if c is None:
                     continue
+                try:
+                    bar_d = (datetime.datetime.utcfromtimestamp(ts[i])
+                             + datetime.timedelta(hours=8)).strftime('%Y%m%d')
+                except Exception:
+                    bar_d = ''
                 rows.append({'c': float(c),
                              'h': float(q.get('high', [])[i] or c),
                              'l': float(q.get('low', [])[i] or c),
-                             'v': int(q.get('volume', [])[i] or 0)})
+                             'v': int(q.get('volume', [])[i] or 0),
+                             'd': bar_d})   # TW bar date — lets callers drop today's partial bar precisely
             if len(rows) >= 60:
                 return rows
         except Exception:

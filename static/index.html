@@ -500,7 +500,7 @@ body *{transition:background-color var(--transition-speed) ease,border-color var
 </div>
 
 <div class="page" id="page-moves">
-  <div class="stitle">⚡ 盤中異動 <span style="font-size:11px;color:var(--dim);font-weight:400">熱門股即時急拉／急殺／漲跌停 · 開盤中每分鐘更新 · 觸發自動推 LINE</span></div>
+  <div class="stitle">⚡ 盤中異動 <span style="font-size:11px;color:var(--dim);font-weight:400">熱門股即時急拉／急殺／漲跌停 · 開盤中每分鐘更新</span></div>
   <div id="moves-status" style="font-size:12px;color:var(--dim);margin-bottom:8px"></div>
   <div id="moves-list"><div class="loading"><span class="spin">↻</span> 掃描盤中異動中...</div></div>
 </div>
@@ -1067,7 +1067,7 @@ async function loadVolRank(){
 
 // Portfolio — independent stock list
 let pUnit=localStorage.getItem('pUnit')||'stock';
-function setUnit(u){pUnit=u;localStorage.setItem('pUnit',u);updateUnitUI();pfData.length?renderPF():loadPortfolio()}
+function setUnit(u){pUnit=u;localStorage.setItem('pUnit',u);updateUnitUI();syncPortfolio();pfData.length?renderPF():loadPortfolio()}
 function updateUnitUI(){
   $('unit-stock').className='hbtn'+(pUnit==='stock'?' gold':'');
   $('unit-lot').className='hbtn'+(pUnit==='lot'?' gold':'');
@@ -1081,16 +1081,26 @@ function getPStocks(){
   if(!ps)return WL.map(w=>({code:w.code,name:w.name,market:w.market||'tse'}));
   return ps;
 }
-function setPStocks(d){localStorage.setItem('portfolioStocks',JSON.stringify(d));syncPortfolio()}
+function setPStocks(d){localStorage.setItem('portfolioStocks',JSON.stringify(d));syncPortfolio(true)}  // explicit edit → may sync empty (清空持股也要同步)
 let _pfSyncT=null;
-function syncPortfolio(){ // mirror holdings to the server (debounced) → 持股健診 LINE 推播用
+let _pfCloudOk=!!localStorage.getItem('portfolioStocks'); // cloud state confirmed? (local copy = authoritative)
+function syncPortfolio(allowEmpty){ // mirror holdings to the server (debounced) → 持股健診 LINE 推播用
   if(_pfSyncT)clearTimeout(_pfSyncT);
-  _pfSyncT=setTimeout(()=>{
+  _pfSyncT=setTimeout(async()=>{
     try{
+      // Never sync while the cloud copy is UNCONFIRMED (restore failed/pending):
+      // an outage must not let a fresh browser overwrite the real portfolio.
+      if(!_pfCloudOk){
+        try{
+          const r=await fetch('/api/portfolio_get');
+          if(r.ok)_pfCloudOk=true;                    // 200 = authoritative (even if empty)
+        }catch(e){}
+        if(!_pfCloudOk){toast('雲端持股尚未確認，暫不同步','error');return}
+      }
       const stocks=JSON.parse(localStorage.getItem('portfolioStocks')||'[]');
-      if(!stocks.length)return;   // never overwrite the cloud copy with an empty set
+      if(!stocks.length&&!allowEmpty)return;   // implicit empty never overwrites the cloud
       const holdings=JSON.parse(localStorage.getItem('portfolio')||'{}');
-      const unit=localStorage.getItem('pUnit')||'lot';
+      const unit=localStorage.getItem('pUnit')||'stock';
       fetch('/api/portfolio_sync',{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({stocks,holdings,unit})}).catch(()=>{});
     }catch(e){}
@@ -1099,11 +1109,14 @@ function syncPortfolio(){ // mirror holdings to the server (debounced) → 持�
 const _pfRestore=(async function restorePortfolio(){ // cross-device restore when this browser has none
   if(localStorage.getItem('portfolioStocks'))return;
   try{
-    const d=await (await fetch('/api/portfolio_get')).json();
+    const r=await fetch('/api/portfolio_get');
+    if(!r.ok)return;              // 502 store_unreachable → keep _pfCloudOk=false, syncs stay blocked
+    const d=await r.json();
+    _pfCloudOk=true;              // 200 = cloud state known (restored OR authoritatively empty)
     if(d&&Array.isArray(d.stocks)&&d.stocks.length){
       localStorage.setItem('portfolioStocks',JSON.stringify(d.stocks));
       if(d.holdings)localStorage.setItem('portfolio',JSON.stringify(d.holdings));
-      if(d.unit)localStorage.setItem('pUnit',d.unit);   // keep 股/張 consistent across devices
+      if(d.unit){localStorage.setItem('pUnit',d.unit);pUnit=d.unit;updateUnitUI()}
     }
   }catch(e){}
 })();
@@ -1127,7 +1140,12 @@ function rmPStock(code){
   toast('已從持股移除','info');loadPortfolio();
 }
 function getP(){return JSON.parse(localStorage.getItem('portfolio')||'{}')}
-function setP(d){localStorage.setItem('portfolio',JSON.stringify(d));syncPortfolio()}
+function setP(d){
+  // Cost/qty edited while the stock list was still the unpersisted WL default →
+  // persist the displayed list first, else the holdings sync carries no stocks.
+  if(!localStorage.getItem('portfolioStocks'))localStorage.setItem('portfolioStocks',JSON.stringify(getPStocks()));
+  localStorage.setItem('portfolio',JSON.stringify(d));syncPortfolio()
+}
 let pfData=[];  // cached analysis results so cost/qty edits re-render instantly
 async function loadPortfolio(){
   updateUnitUI();
@@ -1196,7 +1214,7 @@ function renderPF(){
     else if(s.value_icon==='🔴')nWeak++;
     if(s.value_score!=null){vScoreSum+=s.value_score;vScoreN++;}
     const p=pd[s.code]||{cost:'',qty:''};
-    const cost=parseFloat(p.cost)||0,qty=parseFloat(p.qty)||0;
+    const cost=parseFloat(String(p.cost).replace(/,/g,''))||0,qty=parseFloat(String(p.qty).replace(/,/g,''))||0;   // '1,020' must not parse as 1
     const shares=qty*mul;
     const inv=cost*shares,val=(s.price||0)*shares;
     const pnl=inv>0?val-inv:0,pct=inv>0?(pnl/inv*100):0;
@@ -1292,6 +1310,11 @@ function renderPF(){
   if(nStop)hints.push(`🛑 <b>${nStop} 檔</b>跌破停損參考，優先檢視`);
   if(nGood)hints.push(`🎩 <b>${nGood} 檔</b>巴菲特評為好公司`);
   if(nWeak)hints.push(`⚠️ <b>${nWeak} 檔</b>體質偏弱，建議檢視`);
+  // Cloud-sync status: 持股健診 LINE 推播 only covers what's synced to the cloud.
+  const synced=!!localStorage.getItem('portfolioStocks');
+  hints.push(synced
+    ?'☁️ 持股已同步雲端，盤後健診推播已啟用'
+    :'☁️ <b>目前顯示預設清單</b>：加一檔或改個成本即同步雲端、啟用盤後健診推播');
   $('pf-hint').innerHTML=hints.length?`<div class="pf-hint">💡 ${hints.join(' · ')}</div>`:'';
 }
 function upP(code,field,val){const d=getP();if(!d[code])d[code]={};d[code][field]=val;setP(d);renderPF()}
@@ -2556,7 +2579,7 @@ async function querySignal(){
       const q=s.dividend_quality;
       const dvc={'🏆':'#10b981','💰':'#10b981','📅':'#f5b731','🟡':'#f5b731','⚪':'#6b7fa3','⚠️':'#f97316'}[q.verdict_icon]||'#6b7fa3';
       const chips=[];
-      chips.push(`連續配息 <b>${q.consecutive_years}</b> 年`);
+      chips.push(`連續配息 <b>${q.consec_capped?'≥':''}${q.consecutive_years}</b> 年`);
       if(q.yield!=null)chips.push(`殖利率 <b>${q.yield}%</b>`);
       if(q.payout_ratio!=null)chips.push(`配息率 <b>${q.payout_ratio}%</b>`);
       if(q.ttm_dividend!=null)chips.push(`近一年配 <b>${q.ttm_dividend}</b> 元`);
