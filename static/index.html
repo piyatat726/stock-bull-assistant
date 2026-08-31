@@ -489,6 +489,7 @@ body *{transition:background-color var(--transition-speed) ease,border-color var
 
 <div class="page" id="page-topbuys">
   <div class="stitle">⭐ 今日綜合推薦 <span style="font-size:11px;color:var(--dim);font-weight:400">融合「技術進場＋利多新聞＋科技動能＋估值便宜」最新訊號 · 多訊號同時命中＝強度高 · 僅供參考</span></div>
+  <div id="tb-weather" style="margin-bottom:10px"></div>
   <div id="tb-winrate-box" style="background:var(--card);border-radius:12px;padding:12px 14px;margin-bottom:14px">
     <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap">
       <div style="font-weight:700">📊 這套推薦的歷史勝率回測 <span style="font-size:11px;color:var(--dim);font-weight:400">回測技術進場核心 · 過去真的會賺嗎？</span></div>
@@ -2662,10 +2663,32 @@ async function querySignal(){
         ${s.k!=null?`<span class="sig-ind">K <span>${s.k}</span> D <span>${s.d}</span></span>`:''}
         ${s.macd_hist!=null?`<span class="sig-ind">MACD <span style="color:${s.macd_hist>=0?'var(--green)':'var(--red)'}">DIF ${s.dif} / DEA ${s.dem} / 柱 ${s.macd_hist>=0?'+':''}${s.macd_hist}</span></span>`:''}
       </div>
+      <div id="sig-predict" style="margin-top:10px"></div>
       <div style="margin-top:12px"><button class="btn" onclick="askAI()" style="width:100%;font-size:13px;padding:11px">🤖 問 AI：這檔現在能不能買？</button><div id="ai-result" style="margin-top:8px"></div></div>
     </div>`;
     window.lastSig=s;
+    loadPredict(s.code);
   }catch(e){el.innerHTML='<div class="sig-card" style="color:var(--red);padding:16px">查詢失敗，請確認股票代碼</div>'}
+}
+async function loadPredict(code){ // 🔮 statistical forecast block (bands + probabilities + regime)
+  const el=$('sig-predict'); if(!el)return;
+  el.innerHTML='<div style="font-size:12px;color:var(--dim)">🔮 計算預測中…</div>';
+  try{
+    const r=await fetch('/api/predict?code='+code); const p=await r.json();
+    if(!r.ok||!p||p.error){el.innerHTML='';return}
+    const rows=[];
+    rows.push(`明日預估區間 <b>${p.range1[0]}–${p.range1[1]}</b>　5日 <b>${p.range5[0]}–${p.range5[1]}</b>`);
+    let probLine='';
+    if(p.stock_prob!=null)probLine+=`這檔同類訊號歷史勝率 <b style="color:var(--gold)">${p.stock_prob}%</b>（${p.stock_n} 次）`;
+    if(p.class_regime_prob!=null)probLine+=`${probLine?'　·　':''}目前${p.regime_label}格局下訊號勝率 <b>${p.class_regime_prob}%</b>`;
+    if(probLine)rows.push(probLine);
+    if(p.regime_label)rows.push(`${p.regime_icon||''} 大盤${p.regime_label}格局　歷史同格局 5 日上漲機率 ${p.regime_fwd5_up!=null?p.regime_fwd5_up+'%':'—'}`);
+    el.innerHTML=`<div style="background:rgba(255,176,32,.07);border:1px solid rgba(255,176,32,.25);border-radius:10px;padding:10px 12px;font-size:12.5px;line-height:1.8">
+      <div style="font-weight:700;color:var(--gold);margin-bottom:3px">🔮 統計預測</div>
+      ${rows.map(x=>`<div>${x}</div>`).join('')}
+      <div style="color:var(--dim);font-size:10.5px;margin-top:4px">區間＝近60日波動 ±1σ（歷史涵蓋 ${p.band_coverage||'—'}%）· 機率＝回測頻率 · 統計推估非保證</div>
+    </div>`;
+  }catch(e){el.innerHTML=''}
 }
 async function askAI(){
   const s=window.lastSig, out=$('ai-result'); if(!s||!out)return;
@@ -2694,7 +2717,25 @@ async function askAI(){
   }catch(e){out.innerHTML='<div style="color:var(--red);padding:10px">AI 分析失敗</div>'}
 }
 
+async function loadWeather(){ // 🌦 大盤天氣 + 🔮 預測自評 strip
+  const el=$('tb-weather'); if(!el)return;
+  try{
+    const [wr,pr]=await Promise.all([fetch('/api/market_weather'),fetch('/api/prediction_report')]);
+    const w=wr.ok?await wr.json():null;
+    const p=pr.ok?await pr.json():null;
+    const bits=[];
+    if(w&&w.label)bits.push(`${w.icon||''} 大盤<b>${w.label}</b>格局（${w.index||''}）· 歷史同格局 5 日上漲機率 <b style="color:var(--gold)">${w.fwd5_up_prob!=null?w.fwd5_up_prob+'%':'—'}</b>${w.n_hist?`（${w.n_hist} 次，參考用）`:''}${w.class_win_rate_here!=null?` · 此格局進場訊號勝率 ${w.class_win_rate_here}%`:''}`);
+    if(p&&p.buckets&&p.buckets.length){
+      const t=p.buckets.map(b=>`說${b.predicted_avg}%→實際${b.actual_win_rate}%(${b.n}筆)`).join('、');
+      bits.push(`🔮 預測自評：${t}`);
+    }else if(p&&p.total){
+      bits.push(`🔮 預測自評：樣本累積中（已結 ${p.total} 筆，滿 10 筆開始評分）`);
+    }
+    el.innerHTML=bits.length?`<div style="background:var(--card);border-radius:10px;padding:9px 12px;font-size:12px;line-height:1.7;color:var(--text)">${bits.map(x=>`<div>${x}</div>`).join('')}</div>`:'';
+  }catch(e){el.innerHTML=''}
+}
 async function loadTopBuys(){
+  loadWeather();
   const el=$('topbuys-list'); if(!el) return;
   try{
     const r=await fetch('/api/top_buys'); const d=await r.json();
@@ -2705,8 +2746,10 @@ async function loadTopBuys(){
       const badges=(x.sources||[]).map(s=>`<span class="tbb" style="color:${sc[s]||'var(--dim)'};border-color:${sc[s]||'var(--border)'}">${s}</span>`).join('');
       const reasons=(x.reasons||[]).map(rs=>`<div>· ${rs}</div>`).join('');
       const lv=x.entry?`<div class="tbl"><span>進場 <b>${x.entry}</b></span><span>停損 <b style="color:var(--green)">${x.stop_loss}</b></span><span>目標 <b style="color:var(--red)">${x.target}</b></span>${x.risk_reward?`<span>風報比 <b>1:${x.risk_reward}</b></span>`:''}</div>`:'';
-      const probSrc=x.prob_kind==='stock'?`這檔近12個月同類訊號 ${x.win_prob_n} 次、勝率約`:'此類設定回測勝率約';
-      const fc=x.win_prob?`<div class="tbfc">${x.outlook_tag||'📈'} <b>${x.outlook||'短線偏多'}</b> · ${probSrc} <b style="color:var(--gold)">${x.win_prob}%</b>${x.horizon_days?`（約 ${x.horizon_days} 天）`:''}${x.outlook_note?`<div style="color:var(--dim);font-size:11px;margin-top:2px">${x.outlook_note}</div>`:''}</div>`:'';
+      const probSrc=x.prob_kind==='stock'?`這檔回測近一年同類訊號 ${x.win_prob_n} 次、勝率約`:'此類設定回測勝率約';
+      const rangeLine=x.range5?`<div style="color:var(--dim);font-size:11px;margin-top:2px">🔮 5日預估區間 <b style="color:var(--text)">${x.range5[0]}–${x.range5[1]}</b>（波動推估·理論68%${x.band_coverage?`·日帶實測${x.band_coverage}%`:''}）</div>`:'';
+      const regimeWarn=x.regime_warn?`<div style="color:var(--gold);font-size:11px;margin-top:2px">⚠️ ${x.regime_warn}</div>`:'';
+      const fc=x.win_prob?`<div class="tbfc">${x.outlook_tag||'📈'} <b>${x.outlook||'短線偏多'}</b> · ${probSrc} <b style="color:var(--gold)">${x.win_prob}%</b>${x.horizon_days?`（約 ${x.horizon_days} 天）`:''}${x.outlook_note?`<div style="color:var(--dim);font-size:11px;margin-top:2px">${x.outlook_note}</div>`:''}${rangeLine}${regimeWarn}</div>`:'';
       const stars='●'.repeat(Math.min(x.n_sources,3))+'○'.repeat(Math.max(0,3-x.n_sources));
       return `<div class="tbcard" onclick="openGooayeStock('${x.code}')" title="點看完整分析">
         <div class="tbhead"><span class="tbrank">${i+1}</span>

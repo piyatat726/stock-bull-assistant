@@ -2504,7 +2504,7 @@ def _quick_analysis(code, t0=None):
     st = _stock_bt_stats(code)
     if st and st['n'] >= _STOCKBT_MIN_N:
         tone = '偏低，謹慎' if st['win_rate'] < 40 else '可留意'
-        lines.append(f"展望：這檔近12個月同類訊號 {st['n']} 次、勝率約 {st['win_rate']}%（{tone}）")
+        lines.append(f"展望：這檔回測近一年同類訊號 {st['n']} 次、勝率約 {st['win_rate']}%（{tone}）")
     lines.append('※ 機率推估非保證，僅供參考。更多分析請開 app')
     return '\n'.join(lines)
 
@@ -2605,8 +2605,20 @@ def scan_and_push():
     sig_strong = [s for s in _compute_entry_signals()
                   if s.get('total_weight', 0) >= 8][:5]   # for the 累計戰績 ledger
     sections = []
+    # 🌦 大盤天氣 — regime + honest historical odds, leads every push
+    try:
+        reg = _market_regime()
+        if reg and reg.get('fwd5_up_prob') is not None:
+            wl = (f"🌦 大盤天氣：{reg['icon']} {reg['label']}格局　"
+                  f"歷史同格局 5 日後上漲機率 {reg['fwd5_up_prob']}%（{reg.get('n_hist', 0)} 次，參考用）")
+            crr = _class_regime_rates().get(reg['regime'])
+            if crr:
+                wl += f"\n　此格局下進場訊號歷史勝率 {crr['win_rate']}%（{crr['n']} 筆）"
+            sections.append(wl)
+    except Exception:
+        pass
     if buys:
-        block = ['⭐ 今日綜合推薦（附理由＋短線展望）']
+        block = ['⭐ 今日綜合推薦（附理由＋統計預估）']
         for b in buys:
             line = f"{b.get('outlook_tag', '📈')} {b['name']}({b['code']})　{b.get('change_pct', 0):+.1f}%"
             why = '、'.join(b.get('reasons', [])[:2])
@@ -2615,12 +2627,18 @@ def scan_and_push():
             fc = f"　展望：{b.get('outlook', '短線偏多')}"
             if b.get('win_prob'):
                 if b.get('prob_kind') == 'stock':
-                    fc += f"，這檔近12個月同類訊號 {b.get('win_prob_n')} 次、勝率約 {b['win_prob']}%"
+                    fc += f"，這檔回測近一年同類訊號 {b.get('win_prob_n')} 次、勝率約 {b['win_prob']}%"
                 else:
                     fc += f"，此類設定回測勝率約 {b['win_prob']}%"
                 if b.get('horizon_days'):
                     fc += f"（約 {b['horizon_days']} 天）"
             line += '\n' + fc
+            if b.get('range5'):
+                # ±1σ√5 extrapolation of DAILY vol — label as theory; the measured
+                # coverage stat applies to the 1-day band only (shown in-app).
+                line += f"\n　🔮 5日預估區間 {b['range5'][0]}–{b['range5'][1]}（波動推估·理論68%）"
+            if b.get('regime_warn'):
+                line += f"\n　⚠️ {b['regime_warn']}"
             if b.get('entry'):
                 line += f"\n　進場 {b['entry']}｜停損 {b['stop_loss']}｜目標 {b['target']}"
             block.append(line)
@@ -2631,7 +2649,7 @@ def scan_and_push():
             block.append(f"・{n['name']}({n['code']})　{n['change_pct']:+.1f}%　新聞提及 {n['score']} 次")
         sections.append('\n'.join(block))
 
-    if not sections:
+    if not buys and not news:   # weather alone isn't worth a quota-costing push
         return jsonify({'pushed': False, 'reason': 'no picks today', 'count': 0})
 
     tw_hour = (datetime.datetime.utcnow().hour + 8) % 24
@@ -2678,6 +2696,7 @@ def _pnl_record_topbuys(picks):
                 'market': _alert_mkt(p['code']), 'entry': entry,
                 'stop': p.get('stop_loss'), 'target': p.get('target'),
                 'strategy': '＋'.join(p.get('sources', [])[:3]),
+                'win_prob': p.get('win_prob'),   # stated probability → self-grading calibration
                 'source': 'topbuys'}, timeout=5)
             if r.status_code == 200 and (r.json() or {}).get('ok'):
                 n += 1
@@ -2786,6 +2805,229 @@ def _forecast_baserates():
     return d
 
 
+# ── 🔮 預測引擎 (prediction engine — honest, backtest-grounded, self-grading) ──
+
+_regime_cache = {'t': 0, 'd': None}
+_REGIME_ZH = {'bull': ('多頭', '☀️'), 'range': ('盤整', '⛅'), 'bear': ('空頭', '🌧')}
+
+
+def _classify_regime(closes, i):
+    """Market regime at bar i from MA structure: bull (c>MA20>MA60) /
+    bear (c<MA20<MA60) / range (everything else)."""
+    if i < 59:
+        return None
+    ma20 = sum(closes[i - 19:i + 1]) / 20
+    ma60 = sum(closes[i - 59:i + 1]) / 60
+    c = closes[i]
+    if c > ma20 > ma60:
+        return 'bull'
+    if c < ma20 < ma60:
+        return 'bear'
+    return 'range'
+
+
+def _market_regime():
+    """大盤天氣: current TAIEX regime + HONEST historical forward stats from 5y of
+    data — 'in this same regime, the index closed higher 5 sessions later X% of
+    the time'. Also returns a date→regime map so backtested trades can be
+    conditioned on the regime they were entered in. Cached 6h."""
+    now = time.time()
+    if _regime_cache['d'] is not None and now - _regime_cache['t'] < 21600:
+        return _regime_cache['d']
+    d = None
+    try:
+        raw = cached_get('https://query1.finance.yahoo.com/v8/finance/chart/%5ETWII'
+                         '?interval=1d&range=5y', ttl=21600, timeout=12)
+        cr = (raw.get('chart', {}).get('result') or [{}])[0]
+        ts = cr.get('timestamp', []) or []
+        cls = cr.get('indicators', {}).get('quote', [{}])[0].get('close', []) or []
+        series = [((datetime.datetime.utcfromtimestamp(t) + datetime.timedelta(hours=8)).strftime('%Y%m%d'),
+                   float(c)) for t, c in zip(ts, cls) if t is not None and c and c > 0]
+        # Classify + compute stats on COMPLETED closes only: during the session
+        # Yahoo's last bar is today's live partial bar — drop it (conditionally,
+        # so a pre-market fetch whose last bar is yesterday's close is kept).
+        live_index = series[-1][1] if series else None
+        today_tw = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).strftime('%Y%m%d')
+        if series and series[-1][0] == today_tw:
+            series = series[:-1]
+        dates = [s[0] for s in series]
+        closes = [s[1] for s in series]
+        n = len(closes)
+        if n >= 120:
+            by_date, fwd = {}, {'bull': [], 'range': [], 'bear': []}
+            for i in range(59, n):
+                r = _classify_regime(closes, i)
+                by_date[dates[i]] = r
+                # NON-overlapping 5-day forward windows (stride 5) — overlapping
+                # windows inflated n ~5× and made noise look well-sampled.
+                if r and i % 5 == 0 and i + 5 < n:
+                    fwd[r].append((closes[i + 5] - closes[i]) / closes[i] * 100)
+            cur = _classify_regime(closes, n - 1)
+            f = fwd.get(cur) or []
+            zh, icon = _REGIME_ZH.get(cur, ('未知', '❓'))
+            d = {'regime': cur, 'label': zh, 'icon': icon,
+                 'index': round(live_index if live_index else closes[-1], 2), 'date': dates[-1],
+                 'fwd5_up_prob': round(sum(1 for x in f if x > 0) / len(f) * 100) if f else None,
+                 'fwd5_avg': round(sum(f) / len(f), 2) if f else None,
+                 'n_hist': len(f), 'by_date': by_date}
+    except Exception:
+        d = None
+    _regime_cache['t'] = now
+    _regime_cache['d'] = d
+    if d is None:
+        # Don't latch a failure for 6h — allow a retry in ~10 minutes.
+        _regime_cache['t'] = now - 21000
+    return d
+
+
+_classregime_cache = {'t': 0, 'd': None}
+
+
+def _class_regime_rates():
+    """Setup-class win rates CONDITIONED on the market regime at entry — 'this
+    signal class, entered during a 空頭, historically won X% of the time'. Runs the
+    same _bt_run_stock rules over the popular universe (histories are cached), tags
+    each trade with the regime on its entry date. Cached 6h."""
+    now = time.time()
+    if _classregime_cache['d'] is not None and now - _classregime_cache['t'] < 21600:
+        return _classregime_cache['d']
+    out = {}
+    try:
+        reg = _market_regime()
+        by_date = (reg or {}).get('by_date') or {}
+        if by_date:
+            pairs = [(c, 'tse') for c in POPULAR_TSE[:30]] + [(c, 'otc') for c in POPULAR_OTC[:10]]
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=10) as pool:
+                all_trades = [t for lst in pool.map(
+                    lambda p: _bt_run_stock(p[0], p[1], 12, 5), pairs) for t in lst]
+            buckets = {}
+            for t in all_trades:
+                r = by_date.get(t.get('date') or '')
+                if r:
+                    buckets.setdefault(r, []).append(t['win'])
+            for r, wins in buckets.items():
+                if len(wins) >= 30:   # only trust well-sampled buckets
+                    out[r] = {'win_rate': round(sum(wins) / len(wins) * 100), 'n': len(wins)}
+    except Exception:
+        out = {}
+    _classregime_cache['t'] = now if out else now - 21000   # empty = transient failure → retry in ~10min
+    _classregime_cache['d'] = out
+    return out
+
+
+def _class_regime_rates_cached():
+    """Read-only peek at the regime-conditioned class rates — returns {} instead of
+    triggering the 40-stock backtest. Interactive paths (/api/predict) use this so
+    a cold cache can't stall a user-facing request; cron paths compute for real."""
+    if _classregime_cache['d'] is not None and time.time() - _classregime_cache['t'] < 21600:
+        return _classregime_cache['d']
+    return {}
+
+
+def _predict_stock(code, market=None, live_price=None):
+    """🔮 Per-stock probabilistic forecast — everything verifiable, nothing mystical:
+    (a) T+1 / T+5 price bands from THIS stock's own recent volatility (±1σ ≈ 68%),
+    with the band's actual historical coverage disclosed; (b) direction probability
+    from the per-stock backtest; (c) the current 大盤 regime + the signal class's
+    historical win rate in that regime. Pass live_price when the caller already has
+    a fresh quote (skips a per-code realtime fetch)."""
+    mk = market or _alert_mkt(code)
+    rows = _bt_history(code, mk, '1y')
+    # Fit volatility on COMPLETED daily closes only — drop today's live partial
+    # bar (conditionally: a pre-market fetch's last bar is yesterday's, keep it).
+    today_tw = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).strftime('%Y%m%d')
+    if rows and rows[-1].get('d') == today_tw:
+        rows = rows[:-1]
+    if len(rows) < 40:
+        return None
+    closes = [r['c'] for r in rows]
+    price = live_price or closes[-1]
+    if not live_price:
+        for m in (mk, 'otc' if mk == 'tse' else 'tse'):
+            q = fetch_stocks([(code, m)])
+            if q and q[0].get('price'):
+                price = q[0]['price']
+                break
+    rets = [closes[i] / closes[i - 1] - 1 for i in range(max(1, len(closes) - 60), len(closes))
+            if closes[i - 1]]
+    if not rets:
+        return None
+    mean = sum(rets) / len(rets)
+    sd = (sum((r - mean) ** 2 for r in rets) / len(rets)) ** 0.5 or 0.02
+    cover = round(sum(1 for r in rets if abs(r - mean) <= sd) / len(rets) * 100)
+    dp = 2 if price < 500 else 1
+    out = {
+        'code': code, 'price': price,
+        'range1': [round(price * (1 - sd), dp), round(price * (1 + sd), dp)],
+        'range5': [round(price * (1 - sd * 5 ** 0.5), dp), round(price * (1 + sd * 5 ** 0.5), dp)],
+        'band_coverage': cover,   # historical % of days inside the ±1σ band (honesty check, ≈68 expected)
+        'daily_vol_pct': round(sd * 100, 2),
+    }
+    st = _stock_bt_stats(code)
+    if st and st['n'] >= _STOCKBT_MIN_N:
+        out['stock_prob'] = st['win_rate']
+        out['stock_n'] = st['n']
+        out['horizon'] = st['avg_hold']
+    reg = _market_regime()
+    if reg:
+        out['regime'] = reg['regime']
+        out['regime_label'] = reg['label']
+        out['regime_icon'] = reg['icon']
+        out['regime_fwd5_up'] = reg['fwd5_up_prob']
+        # cached-only peek: an interactive request must never trigger the
+        # 40-stock class backtest (cold ≈ tens of seconds).
+        crr = _class_regime_rates_cached().get(reg['regime'])
+        if crr:
+            out['class_regime_prob'] = crr['win_rate']
+            out['class_regime_n'] = crr['n']
+    return out
+
+
+@app.route('/api/predict')
+def predict():
+    """🔮 個股預測: statistical bands + backtested probabilities + regime context.
+    Everything here is a probability estimate from historical data — never a
+    guarantee, and the app grades its own past predictions (/api/prediction_report)."""
+    code = request.args.get('code', '').strip()
+    if not code:
+        return jsonify({'error': 'need code'}), 400
+    try:
+        p = _predict_stock(code)
+    except Exception:
+        p = None
+    if not p:
+        return jsonify({'error': 'no data', 'code': code}), 404
+    p['note'] = ('區間＝該股近 60 日波動度推算（±1σ，理論涵蓋 ~68%）；機率＝歷史回測頻率。'
+                 '皆為統計推估、非保證。')
+    return jsonify(p)
+
+
+@app.route('/api/market_weather')
+def market_weather():
+    """🌦 大盤天氣: current regime + honest historical forward odds."""
+    reg = _market_regime()
+    if not reg:
+        return jsonify({'error': 'no data'}), 503
+    out = {k: v for k, v in reg.items() if k != 'by_date'}
+    crr = _class_regime_rates().get(reg['regime'])
+    if crr:
+        out['class_win_rate_here'] = crr['win_rate']
+        out['class_n_here'] = crr['n']
+    return jsonify(out)
+
+
+@app.route('/api/prediction_report')
+def prediction_report():
+    """🔮 預測自評: the app grades its OWN past predictions — realized win rate per
+    stated-probability bucket, from the paper ledger (val /api/calibration)."""
+    url = os.environ.get('PNL_VAL_URL', '')
+    if not url:
+        return jsonify({'enabled': False})
+    d = cached_get(url.rstrip('/') + '/api/calibration', ttl=600, timeout=10) or {}
+    return jsonify({'enabled': True, **d})
+
+
 _stockbt_cache = {}
 _STOCKBT_MIN_N = 8   # per-stock sample floor — below this the win% is noise, use class rate
 
@@ -2844,7 +3086,7 @@ def _add_outlook(picks):
             p['prob_kind'] = 'stock'
             p['win_prob'] = st['win_rate']
             p['win_prob_n'] = st['n']
-            p['win_prob_class'] = f"這檔近12個月同類訊號 {st['n']} 次"
+            p['win_prob_class'] = f"這檔回測近一年同類訊號 {st['n']} 次"
             p['horizon_days'] = st['avg_hold'] or (round(rates['horizon']) if rates['horizon'] else None)
             # Honesty: if THIS stock historically responds poorly to this setup,
             # the outlook wording must say so — not contradict the number.
@@ -2859,6 +3101,28 @@ def _add_outlook(picks):
             p['win_prob_n'] = None
             p['win_prob_class'] = '多訊號確認' if multi else '單一訊號'
             p['horizon_days'] = round(rates['horizon']) if rates['horizon'] else None
+        # 🔮 prediction extras: 5-day volatility band (history already cached by the
+        # warm above) + regime-conditioned honesty note in a 空頭 market.
+        try:
+            pred = _predict_stock(p['code'], live_price=p.get('price'))
+            if pred:
+                p['range5'] = pred['range5']
+                p['daily_vol_pct'] = pred['daily_vol_pct']
+                p['band_coverage'] = pred.get('band_coverage')
+        except Exception:
+            pass
+    try:
+        reg = _market_regime()
+        if reg and reg['regime'] == 'bear':
+            crr = _class_regime_rates().get('bear')
+            # The bear warning must NOT silently vanish when the bear bucket is
+            # under-sampled — fall back to a number-free version.
+            warn = (f"目前{reg['label']}格局，同類訊號歷史勝率 {crr['win_rate']}%，建議縮小部位"
+                    if crr else f"目前{reg['label']}格局，順勢訊號勝率通常較低，建議縮小部位")
+            for p in picks:
+                p['regime_warn'] = warn
+    except Exception:
+        pass
     return picks
 
 
@@ -3418,8 +3682,19 @@ def weekly_scorecard():
     if len(rows) > 8:
         lines.append(f'…共 {len(rows)} 檔')
     lines += ['', f"累計戰績：勝率 {st.get('win_rate', 0)}%（{st.get('wins', 0)}勝{st.get('losses', 0)}敗）"
-                  f"｜總報酬 {_fmt_pct(st.get('total_pnl_pct'))}",
-              f'👉 完整戰績：{url}',
+                  f"｜總報酬 {_fmt_pct(st.get('total_pnl_pct'))}"]
+    # 🔮 self-grading: stated probability vs realized outcome
+    try:
+        cal = cached_get(url.rstrip('/') + '/api/calibration', ttl=600, timeout=10) or {}
+        bks = cal.get('buckets') or []
+        if bks:
+            parts = [f"說{b['predicted_avg']}%→實際{b['actual_win_rate']}%({b['n']}筆)" for b in bks]
+            lines.append('🔮 預測校準：' + '、'.join(parts))
+        elif cal.get('total'):
+            lines.append(f"🔮 預測校準：樣本累積中（已結 {cal['total']} 筆，滿 10 筆開始評分）")
+    except Exception:
+        pass
+    lines += [f'👉 完整戰績：{url}',
               '', '※ 紙上模擬、不含手續費滑價。僅供參考']
     res = _line_push('\n'.join(lines), len(rows))
     return jsonify({'pushed': bool(res.get('pushed')), 'entries': len(rows),
@@ -4659,7 +4934,7 @@ def _bt_history(code, market, rng='1y'):
             rows = []
             for i in range(len(ts)):
                 c = q.get('close', [])[i] if i < len(q.get('close', [])) else None
-                if c is None:
+                if not c or c <= 0:   # None AND zero closes are both bad bars
                     continue
                 try:
                     bar_d = (datetime.datetime.utcfromtimestamp(ts[i])
@@ -4748,6 +5023,7 @@ def _bt_run_stock(code, market, months=12, min_weight=5, max_hold=20):
     rows = rows[-(months * 21 + 60):] if months * 21 + 60 < len(rows) else rows
     closes = [r['c'] for r in rows]; highs = [r['h'] for r in rows]
     lows = [r['l'] for r in rows]; vols = [r['v'] for r in rows]
+    dates = [r.get('d', '') for r in rows]
     rsi, k, d, hist = _bt_indicators(closes, highs, lows)
     n = len(closes)
     ma = lambda p, i: sum(closes[i - p + 1:i + 1]) / p if i >= p - 1 else None
@@ -4789,7 +5065,7 @@ def _bt_run_stock(code, market, months=12, min_weight=5, max_hold=20):
                 exit_i = min(i + max_hold, n - 1)
                 outcome = (closes[exit_i] - entry) / entry * 100
             trades.append({'ret': outcome, 'hold': exit_i - i, 'win': outcome > 0,
-                           'confirmed': confirmed, 'code': code})
+                           'confirmed': confirmed, 'code': code, 'date': dates[i]})
             i = exit_i + 1  # no overlapping trades on same stock
         else:
             i += 1
