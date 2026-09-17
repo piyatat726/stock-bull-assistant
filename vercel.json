@@ -1,9 +1,10 @@
 {
   "builds": [
+    { "src": "static/**", "use": "@vercel/static" },
     { "src": "server.py", "use": "@vercel/python" }
   ],
   "routes": [
-    { "src": "/static/(.*)", "dest": "/static/$1" },
+    { "src": "/static/(.*)", "dest": "/static/$1", "headers": { "cache-control": "public, max-age=0, must-revalidate" } },
     { "src": "/(.*)", "dest": "/server.py" }
   ]
 }
