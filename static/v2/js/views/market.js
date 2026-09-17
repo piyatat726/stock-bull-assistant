@@ -3,7 +3,7 @@
 // 分段切換或 teardown 後，所有進行中的填充一律略過（segGen / alive 守門）。
 // 顏色規則：價格／漲跌／買賣超／量能 → 紅漲綠跌（cls / pctPill / priceBox）；
 // 盤後展望這類「判斷」只用 judge() 徽章，不替裸數字上判斷色。
-import { render as paint, esc, num, cls, signPct, fmtPrice, fmtInt, pctPill, skLines, timeAgo, marketOpen, store, twNow, toast } from '../ui.js';
+import { render as paint, esc, num, cls, signPct, fmtPrice, fmtInt, pctPill, skLines, timeAgo, marketOpen, store, twNow, toast, skCards } from '../ui.js';
 import { API, get, invalidate } from '../api.js';
 import { sectionHead, chip, judge, emptyState, stockRow, stockHref, tiles, sectorIcon, skyHero, breadthCard, sectorMap } from '../components.js';
 import { mountEquity } from '../chart.js';
