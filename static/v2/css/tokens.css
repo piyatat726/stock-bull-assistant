@@ -1,0 +1,103 @@
+/* ─────────────────────────────────────────────────────────────
+   台股小牛 v2 — Design tokens. Look: 市場天氣 reference — deep-blue gradient
+   surfaces, lavender primary, editorial serif headlines, soft signal colours.
+   Convention kept: 台股 紅漲綠跌 (softened coral / mint). Tabular numbers.
+   ───────────────────────────────────────────────────────────── */
+:root {
+  /* brand / primary (lavender) */
+  --primary: #B9B1F2;
+  --primary-2: #8F85E6;
+  --primary-ink: #171436;
+  --primary-soft: rgba(185, 177, 242, .16);
+  --primary-line: rgba(185, 177, 242, .38);
+  /* warmth (sun / highlight) */
+  --sun: #F6C453;
+  --gold: #F6C453;             /* legacy alias used by components */
+  --gold-600: #E0A93A;
+  --gold-soft: rgba(246, 196, 83, .14);
+  --gold-line: rgba(246, 196, 83, .34);
+
+  /* semantics (台股慣例 紅漲綠跌, softened) */
+  --up: #FF8A8A;
+  --up-soft: rgba(255, 138, 138, .16);
+  --down: #7FE0B4;
+  --down-soft: rgba(127, 224, 180, .16);
+  --flat: #A9B2C7;
+  --warn: #F6C453;
+  --info: #8AB4FF;
+  --purple: #C9A7FF;
+
+  /* surfaces — deep blue night */
+  --bg: #0B1226;
+  --bg-2: #101A36;
+  --card: #141F3F;
+  --card-2: #1B2850;
+  --card-grad: linear-gradient(160deg, #1A2752 0%, #121C3D 60%, #0F1733 100%);
+  --line: rgba(185, 177, 242, .12);
+  --line-strong: rgba(185, 177, 242, .28);
+  --text: #F1F3FA;
+  --text-2: #C3C9DC;
+  --dim: #8891AD;
+  --inverse: #0B1226;
+
+  /* type */
+  --font: -apple-system, BlinkMacSystemFont, "PingFang TC", "Noto Sans TC", "Microsoft JhengHei", "Segoe UI", Roboto, system-ui, sans-serif;
+  --font-display: "Noto Serif TC", "PingFang TC", "Songti TC", serif;
+  --fs-xs: 11px; --fs-sm: 13px; --fs-md: 15px; --fs-lg: 17px;
+  --fs-xl: 20px; --fs-2xl: 26px; --fs-3xl: 34px;
+  --lh: 1.5;
+
+  /* space (4pt) */
+  --s-1: 4px; --s-2: 8px; --s-3: 12px; --s-4: 16px; --s-5: 20px; --s-6: 24px; --s-8: 32px;
+
+  /* shape */
+  --r-sm: 14px; --r-md: 20px; --r-lg: 26px; --r-pill: 999px;
+
+  /* elevation */
+  --shadow-1: 0 2px 8px rgba(3, 8, 24, .35);
+  --shadow-2: 0 12px 32px rgba(3, 8, 24, .45);
+
+  /* motion */
+  --ease: cubic-bezier(.2,.8,.2,1);
+  --t-fast: 150ms; --t-base: 260ms;
+
+  /* layout */
+  --nav-h: 66px;
+  --safe-b: env(safe-area-inset-bottom, 0px);
+  --safe-t: env(safe-area-inset-top, 0px);
+  --page-max: 720px;
+  color-scheme: dark;
+}
+
+:root[data-theme="light"] {
+  --bg: #F4F5FB;
+  --bg-2: #FFFFFF;
+  --card: #FFFFFF;
+  --card-2: #EEF0FA;
+  --card-grad: linear-gradient(160deg, #FFFFFF 0%, #F4F5FD 100%);
+  --line: rgba(60, 50, 140, .10);
+  --line-strong: rgba(60, 50, 140, .22);
+  --text: #141A33;
+  --text-2: #3F4766;
+  --inverse: #FFFFFF;
+  --primary: #7C72DF;
+  --primary-2: #6A5FD6;
+  --primary-ink: #FFFFFF;
+  --primary-soft: rgba(124, 114, 223, .12);
+  --primary-line: rgba(124, 114, 223, .30);
+  --up: #E0605F;
+  --up-soft: rgba(224, 96, 95, .12);
+  --down: #2FA97C;
+  --down-soft: rgba(47, 169, 124, .12);
+  --dim: #6B7390;
+  --gold: #9A6700;
+  --gold-600: #7E5400;
+  --gold-soft: rgba(154, 103, 0, .10);
+  --gold-line: rgba(154, 103, 0, .30);
+  --warn: #9A6700;
+  --shadow-1: 0 2px 8px rgba(20, 26, 51, .06);
+  --shadow-2: 0 12px 32px rgba(20, 26, 51, .10);
+  color-scheme: light;
+}
+
+@media (prefers-reduced-motion: reduce) { :root { --t-fast: 0ms; --t-base: 0ms; } }

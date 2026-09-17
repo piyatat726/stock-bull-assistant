@@ -401,6 +401,32 @@ def fetch_stocks(code_market_pairs):
 def index():
     return send_from_directory('static', 'index.html')
 
+
+# ── v2 frontend (mobile-first PWA), served in parallel at /v2 until it replaces / ──
+@app.route('/v2')
+@app.route('/v2/')
+def v2_index():
+    r = send_from_directory('static/v2', 'index.html')
+    r.headers['Cache-Control'] = 'no-cache'
+    return r
+
+
+@app.route('/v2/sw.js')
+def v2_sw():
+    # Served from the /v2/ path so the service-worker scope is /v2/ without needing
+    # a Service-Worker-Allowed header; never cache the worker itself.
+    r = send_from_directory('static/v2', 'sw.js')
+    r.headers['Content-Type'] = 'application/javascript'
+    r.headers['Cache-Control'] = 'no-cache'
+    return r
+
+
+@app.route('/v2/manifest.webmanifest')
+def v2_manifest():
+    r = send_from_directory('static/v2', 'manifest.webmanifest')
+    r.headers['Content-Type'] = 'application/manifest+json'
+    return r
+
 @app.route('/api/version')
 def version():
     test_code = request.args.get('test', '2317')
@@ -3001,6 +3027,58 @@ def predict():
     p['note'] = ('區間＝該股近 60 日波動度推算（±1σ，理論涵蓋 ~68%）；機率＝歷史回測頻率。'
                  '皆為統計推估、非保證。')
     return jsonify(p)
+
+
+_breadth_cache = {'t': 0, 'd': None}
+
+
+@app.route('/api/market_breadth')
+def market_breadth():
+    """🌤 今天的市場「天氣」— computed from REAL quotes of the popular universe:
+    breadth (上漲/下跌/持平 %), volatility level (avg |change|), a plain-language
+    weather label + headline. Describes the CURRENT state; it does not predict.
+    Cached 20s. Uses the last session's quotes when the market is closed."""
+    now = time.time()
+    if _breadth_cache['d'] is not None and now - _breadth_cache['t'] < 20:
+        return jsonify(_breadth_cache['d'])
+    # Accept estimated prices too (MIS z='-' between prints → bid/ask midpoint):
+    # breadth only needs the sign/size of the day's move, and a midpoint is
+    # within a tick of the last trade. Keep only quotes from the LATEST session
+    # in the sample so a stale holiday snapshot can't mix with fresh ones.
+    raw = [q for q in fetch_stocks(_intraday_universe()) if q and q.get('price') and q.get('yesterday')]
+    latest = max((str(q.get('date') or '') for q in raw), default='')
+    qs = [q for q in raw if str(q.get('date') or '') == latest]
+    ups = downs = flats = 0; absum = 0.0; as_of = latest
+    for q in qs:
+        try:
+            cp = float(q.get('change_pct') or 0)
+        except (TypeError, ValueError):
+            continue
+        if cp > 0.2: ups += 1
+        elif cp < -0.2: downs += 1
+        else: flats += 1
+        absum += abs(cp)
+    n = ups + downs + flats
+    if n < 10:
+        return jsonify({'error': 'no data'}), 503
+    up_r = ups / n
+    avg_abs = absum / n
+    if up_r >= 0.65:   w, ic, head = '晴', '☀️', '多數股票上漲，氣氛偏強'
+    elif up_r >= 0.5:  w, ic, head = '晴時多雲', '🌤', '多數股票上漲，表現仍有差異'
+    elif up_r >= 0.35: w, ic, head = '多雲', '⛅', '漲跌互見，方向不明'
+    elif up_r >= 0.2:  w, ic, head = '陰', '🌥', '多數股票下跌，偏弱'
+    else:              w, ic, head = '雨', '🌧', '普遍下跌，留意風險'
+    vol = '平穩' if avg_abs < 1.0 else ('震盪' if avg_abs < 2.5 else '劇烈')
+    tw = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+    hm = tw.hour * 60 + tw.minute
+    open_now = tw.weekday() < 5 and 9 * 60 <= hm <= 13 * 60 + 31
+    d = {'weather': w, 'icon': ic, 'headline': head,
+         'up_pct': round(up_r * 100), 'down_pct': round(downs / n * 100), 'flat_pct': round(flats / n * 100),
+         'n': n, 'avg_abs_pct': round(avg_abs, 2), 'vol_level': vol,
+         'per10': round(up_r * 10), 'as_of': as_of, 'market_open': open_now, 'tw_time': tw.strftime('%H:%M'),
+         'note': '天氣描述目前市場狀態（熱門股樣本），不預測漲跌。'}
+    _breadth_cache['t'] = now; _breadth_cache['d'] = d
+    return jsonify(d)
 
 
 @app.route('/api/market_weather')

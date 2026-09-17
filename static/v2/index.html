@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="zh-Hant-TW">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>台股小牛助理</title>
+<meta name="description" content="台股即時推薦、預測與持股健診 — 每個建議都告訴你為什麼">
+<meta name="theme-color" content="#0B1226">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="小牛">
+<meta name="mobile-web-app-capable" content="yes">
+<link rel="manifest" href="/v2/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/static/v2/icons/apple-touch-icon.png">
+<link rel="icon" type="image/png" sizes="64x64" href="/static/v2/icons/favicon-64.png">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Serif+TC:wght@700&display=swap">
+<link rel="stylesheet" href="/static/v2/css/tokens.css">
+<link rel="stylesheet" href="/static/v2/css/base.css">
+<link rel="stylesheet" href="/static/v2/css/components.css">
+<script>try{var t=localStorage.getItem('theme');if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+<script src="https://unpkg.com/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js" async crossorigin="anonymous" integrity="sha384-rcCMiCptH4kTlEbg0euOTUKWe72TESbrjElatnG+9BfbmUIV268UK/Pro5biJdGm"></script>
+</head>
+<body>
+<div id="progress" class="progress"></div>
+<div class="app">
+  <header class="topbar">
+    <div class="brand">
+      <span style="font-size:22px">🐂</span>
+      <div><div id="brand-title">台股小牛</div><small id="brand-sub">載入中…</small></div>
+    </div>
+    <div class="row" style="gap:8px">
+      <div id="hdr-index" class="num sm" style="text-align:right;line-height:1.15"></div>
+      <button class="iconbtn" id="btn-search" aria-label="搜尋股票">🔍</button>
+      <button class="iconbtn" id="btn-theme" aria-label="切換深淺色">☀️</button>
+    </div>
+  </header>
+  <div id="ptr" class="ptr">↓ 下拉刷新</div>
+  <div id="offline" class="offline" hidden>📴 目前離線，顯示最後一次取得的資料</div>
+  <main id="view" class="page"></main>
+</div>
+
+<nav class="tabbar" aria-label="主導覽">
+  <div class="inner">
+    <a class="tab" href="#/home" data-tab="home"><span class="ic">🏠</span>首頁</a>
+    <a class="tab" href="#/picks" data-tab="picks"><span class="ic">⭐</span>選股</a>
+    <a class="tab" href="#/market" data-tab="market"><span class="ic">📈</span>市場</a>
+    <a class="tab" href="#/portfolio" data-tab="portfolio"><span class="ic">💼</span>持股</a>
+    <a class="tab" href="#/more" data-tab="more"><span class="ic">☰</span>更多</a>
+  </div>
+</nav>
+
+<noscript><div class="empty">需要開啟 JavaScript 才能使用小牛</div></noscript>
+<script type="module" src="/static/v2/js/app.js"></script>
+</body>
+</html>

@@ -8,3 +8,5 @@ ngrok_domain.txt
 *.log
 .DS_Store
 .vercel
+.claude/
+start.command
